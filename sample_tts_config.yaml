@@ -1,0 +1,31 @@
+# Dataset configuration
+TTS_dataset: "/mnt/disk3/Orpheus-TTS/combined_tts_dataset_finetune"
+# text_QA_dataset: "/path/to/your/text/dataset"  # Comment out for TTS-only training
+
+# Voice type and language (optional, for documentation)
+voice_type: "all"
+
+# Model configuration
+model_name: "meta-llama/Llama-3.2-3B-Instruct"
+tokenizer_name: "meta-llama/Llama-3.2-3B-Instruct"
+
+# Training arguments
+epochs: 10
+batch_size: 1
+number_processes: 4
+pad_token: 128263  # Should match your tokenizer's pad token
+save_steps: 5000
+learning_rate: 5.0e-5
+lr_scheduler_type: "cosine"  # or "constant" or "linear"
+
+# Naming and paths
+save_folder: "checkpoints_llada_tts"
+project_name: "llada-tts-experiment"
+run_name: "llada-tts-run-1"
+
+# TTS-specific settings (optional, will use defaults)
+# num_audio_tokens: 28672  # 7 * 4096
+# num_special_tokens: 10
+# max_length: 4096
+# mask_token_id: 126336
+# eps: 1e-3 
