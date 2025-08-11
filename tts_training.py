@@ -403,22 +403,24 @@ class LLaDATTSTrainer:
         )
         
         # Learning rate scheduler
+        total_steps = self.steps_per_epoch * self.config.epochs
+        
         if self.config.lr_scheduler_type == "cosine":
             from torch.optim.lr_scheduler import CosineAnnealingLR
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
-                T_max=self.config.max_steps,
+                T_max=total_steps,
                 eta_min=self.config.learning_rate * 0.1
             )
         elif self.config.lr_scheduler_type == "constant":
             from torch.optim.lr_scheduler import LambdaLR
-            self.scheduler = LambdaLR(self.optimizer, lambda epoch: 1.0)
+            self.scheduler = LambdaLR(self.optimizer, lambda step: 1.0)
         else:
             # Default to linear warmup
             self.scheduler = get_linear_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=self.config.warmup_steps,
-                num_training_steps=self.config.max_steps
+                num_warmup_steps=self.warmup_steps,
+                num_training_steps=total_steps
             )
     
     def setup_datasets(self):
@@ -430,11 +432,13 @@ class LLaDATTSTrainer:
             self.config, self.tokenizer
         )
         
-        # Calculate max_steps if not already set
-        if self.config.max_steps is None:
-            dataset_size = len(self.combined_dataset)
-            self.config.max_steps = self.config.calculate_max_steps(dataset_size)
-            self.logger.info(f"Calculated max_steps: {self.config.max_steps} (from {self.config.epochs} epochs over {dataset_size} examples)")
+        # Calculate warmup steps for scheduler
+        dataset_size = len(self.combined_dataset)
+        self.warmup_steps = self.config.calculate_warmup_steps(dataset_size)
+        self.steps_per_epoch = dataset_size // (self.config.batch_size * self.config.gradient_accumulation_steps * self.world_size)
+        if self.steps_per_epoch == 0:
+            self.steps_per_epoch = 1
+        self.logger.info(f"Training setup: {self.config.epochs} epochs, {self.steps_per_epoch} steps per epoch, {self.warmup_steps} warmup steps")
         
         # Log dataset information
         if self.config.ratio == 0.0:
@@ -619,7 +623,7 @@ class LLaDATTSTrainer:
         
         return metrics
     
-    def log_metrics(self, metrics: Dict[str, Any], global_step: int):
+    def log_metrics(self, metrics: Dict[str, Any], global_step: int, epoch: int = None):
         """Log metrics based on data type"""
         if not self.is_main_process():
             return
@@ -635,6 +639,8 @@ class LLaDATTSTrainer:
                 "global_step": global_step,
                 "learning_rate": self.scheduler.get_last_lr()[0] if hasattr(self.scheduler, 'get_last_lr') else self.config.learning_rate
             }
+            if epoch is not None:
+                wandb_metrics["epoch"] = epoch
             if self.config.wandb_project:
                 wandb.log(wandb_metrics, step=global_step)
             
@@ -680,7 +686,7 @@ class LLaDATTSTrainer:
                 )
                 self.text_step += 1
     
-    def save_model(self, output_dir: str, step: int):
+    def save_model(self, output_dir: str, step: int, epoch: int = None):
         """Save model checkpoint"""
         if not self.is_main_process():
             return
@@ -711,6 +717,7 @@ class LLaDATTSTrainer:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "step": step,
+            "epoch": epoch,
             "text_step": self.text_step,
             "audio_step": self.audio_step
         }
@@ -719,67 +726,89 @@ class LLaDATTSTrainer:
         self.logger.info(f"Model saved to {output_dir}")
     
     def train(self):
-        """Main training loop"""
-        self.logger.info(f"Starting TTS training with {len(self.combined_dataset)} examples")
+        """Main training loop using epochs"""
+        self.logger.info(f"Starting TTS training with {len(self.combined_dataset)} examples for {self.config.epochs} epochs")
         
         global_step = 0
         
-        # Create infinite dataloader
-        def infinite_dataloader():
-            while True:
-                if hasattr(self.dataloader.sampler, 'set_epoch'):
-                    self.dataloader.sampler.set_epoch(global_step // len(self.dataloader))
-                for batch in self.dataloader:
-                    yield batch
-        
-        data_iter = infinite_dataloader()
-        
-        # Training loop
-        progress_bar = tqdm(range(self.config.max_steps), desc="TTS Training", disable=not self.is_main_process())
-        
-        for step in progress_bar:
-            batch = next(data_iter)
+        # Training loop by epochs
+        for epoch in range(self.config.epochs):
+            self.logger.info(f"Starting epoch {epoch + 1}/{self.config.epochs}")
             
-            # Training step
-            metrics = self.train_step(batch)
+            # Set epoch for distributed sampler
+            if hasattr(self.dataloader.sampler, 'set_epoch'):
+                self.dataloader.sampler.set_epoch(epoch)
             
-            # Gradient accumulation
-            if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            # Initialize progress bar for this epoch
+            progress_bar = tqdm(
+                self.dataloader, 
+                desc=f"Epoch {epoch + 1}/{self.config.epochs}", 
+                disable=not self.is_main_process(),
+                total=len(self.dataloader)
+            )
+            
+            epoch_loss = 0.0
+            num_batches = 0
+            
+            # Training loop for this epoch
+            for step, batch in enumerate(progress_bar):
+                # Training step
+                metrics = self.train_step(batch)
                 
-                # Optimizer step
-                self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer.zero_grad()
-                
-                global_step += 1
-                
-                # Logging
-                if global_step % self.config.logging_steps == 0:
-                    self.log_metrics(metrics, global_step)
-                
-                # Save checkpoint
-                if global_step % self.config.save_steps == 0:
-                    checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{global_step}")
-                    self.logger.info(f"Saving checkpoint at step {global_step} to {checkpoint_dir}")
-                    try:
-                        self.save_model(checkpoint_dir, global_step)
-                        self.logger.info(f"Successfully saved checkpoint-{global_step}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to save checkpoint at step {global_step}: {e}")
+                # Gradient accumulation
+                if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                    
+                    # Optimizer step
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
+                    
+                    global_step += 1
+                    epoch_loss += metrics['loss']
+                    num_batches += 1
+                    
+                    # Log metrics periodically
+                    if global_step % 10 == 0:
+                        if self.is_main_process():
+                            # Print loss immediately
+                            loss_type = "audio" if self.config.ratio == 0.0 else metrics.get('loss_type', 'unknown')
+                            current_step = self.audio_step if self.config.ratio == 0.0 else (self.text_step if metrics.get('loss_type') == 'text' else self.audio_step)
+                            ppl = torch.exp(torch.tensor(metrics['loss'])).item()
+                            self.logger.info(f"Epoch {epoch + 1}, Step {current_step}: loss={metrics['loss']:.4f}, ppl={ppl:.2f}, masked_tokens={metrics.get('masked_tokens', 'N/A')}")
+                            
+                            self.log_metrics(metrics, global_step, epoch)
                 
                 # Update progress bar
                 progress_bar.set_postfix({
                     "loss": f"{metrics['loss']:.4f}",
-                    "type": metrics.get('loss_type', 'unknown')
+                    "type": metrics.get('loss_type', 'unknown'),
+                    "epoch_avg": f"{epoch_loss / max(num_batches, 1):.4f}"
                 })
+            
+            # Calculate epoch average loss
+            avg_epoch_loss = epoch_loss / max(num_batches, 1)
+            self.logger.info(f"Epoch {epoch + 1} completed! Average loss: {avg_epoch_loss:.4f}")
+            
+            # Save checkpoint after each epoch (or based on save_epochs)
+            if (epoch + 1) % self.config.save_epochs == 0:
+                checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-epoch-{epoch + 1}")
+                self.logger.info(f"Saving checkpoint after epoch {epoch + 1} to {checkpoint_dir}")
+                try:
+                    self.save_model(checkpoint_dir, global_step, epoch + 1)
+                    self.logger.info(f"Successfully saved checkpoint for epoch {epoch + 1}")
+                except Exception as e:
+                    self.logger.error(f"Failed to save checkpoint after epoch {epoch + 1}: {e}")
+            
+            progress_bar.close()
         
         # Save final checkpoint
-        final_dir = os.path.join(self.config.output_dir, "final")
-        self.save_model(final_dir, global_step)
-        
-        self.logger.info("TTS training completed!")
+        if self.is_main_process():
+            final_checkpoint_dir = os.path.join(self.config.output_dir, "final_checkpoint")
+            self.save_model(final_checkpoint_dir, global_step, self.config.epochs)
+            self.logger.info(f"Training completed! Final model saved to {final_checkpoint_dir}")
+            self.logger.info(f"Total training steps: {global_step}")
 
 
 def main():

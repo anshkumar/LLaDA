@@ -60,8 +60,8 @@ def main():
     parser.add_argument("--output_dir", type=str, help="Override output directory")
     parser.add_argument("--batch_size", type=int, help="Override batch size")
     parser.add_argument("--learning_rate", type=float, help="Override learning rate")
-    parser.add_argument("--max_steps", type=int, help="Override max steps")
-    parser.add_argument("--force_save", action="store_true", help="Force save checkpoint immediately")
+    parser.add_argument("--epochs", type=int, help="Override number of epochs")
+    parser.add_argument("--save_epochs", type=int, help="Override save frequency (epochs)")
     parser.add_argument("--ratio", type=float, help="Override text/TTS ratio")
     parser.add_argument("--wandb_project", type=str, help="Override wandb project")
     parser.add_argument("--wandb_run_name", type=str, help="Override wandb run name")
@@ -118,8 +118,10 @@ def main():
         config.batch_size = args.batch_size
     if args.learning_rate:
         config.learning_rate = args.learning_rate
-    if args.max_steps:
-        config.max_steps = args.max_steps
+    if args.epochs:
+        config.epochs = args.epochs
+    if args.save_epochs:
+        config.save_epochs = args.save_epochs
     if args.ratio:
         config.ratio = args.ratio
     if args.wandb_project:
@@ -144,7 +146,8 @@ def main():
     logger.info(f"  Batch Size: {config.batch_size}")
     logger.info(f"  Learning Rate: {config.learning_rate}")
     logger.info(f"  LR Scheduler: {config.lr_scheduler_type}")
-    logger.info(f"  Max Steps: {config.max_steps}")
+    logger.info(f"  Epochs: {config.epochs}")
+    logger.info(f"  Save Every: {config.save_epochs} epochs")
     logger.info(f"  Pad Token ID: {config.pad_token_id}")
     logger.info(f"  Audio Tokens: {config.num_audio_tokens}")
     logger.info(f"  Special Tokens: {config.num_special_tokens}")
