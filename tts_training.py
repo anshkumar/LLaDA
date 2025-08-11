@@ -29,8 +29,8 @@ class LLaDATTSTrainer:
         self.setup_distributed()
         self.setup_tokenizer()
         self.setup_model()
+        self.setup_datasets()  # Move before optimizer to calculate max_steps first
         self.setup_optimizer()
-        self.setup_datasets()
         
         # Tracking for different data types
         self.text_step = 0
@@ -297,16 +297,34 @@ class LLaDATTSTrainer:
             self.model.resize_token_embeddings(new_vocab_size)
         
         # Move to device
-        self.model.to(self.device)
+        # Enable gradient checkpointing for memory efficiency
+        self.model.gradient_checkpointing_enable()
+        self.logger.info("✅ Enabled gradient checkpointing")
+        
+        # Move to device with mixed precision
+        self.model = self.model.to(device=self.device, dtype=torch.bfloat16)
+        self.logger.info("✅ Using bfloat16 mixed precision")
         
         # Setup FSDP if enabled and multiple GPUs
         if self.config.fsdp and self.world_size > 1:
-            self.logger.info("Setting up FSDP")
+            from torch.distributed.fsdp import MixedPrecision, CPUOffload, ShardingStrategy
+            from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+            from llada_model import LLaDADecoderLayer
+            
+            self.logger.info("Setting up memory-optimized FSDP")
             self.model = FSDP(
                 self.model,
-                auto_wrap_policy=None,  # auto_wrap
-                mixed_precision=None,  # Will use bf16 if specified
+                auto_wrap_policy=ModuleWrapPolicy({LLaDADecoderLayer}),
+                mixed_precision=MixedPrecision(
+                    param_dtype=torch.bfloat16,
+                    reduce_dtype=torch.bfloat16,
+                    buffer_dtype=torch.bfloat16,
+                ),
                 device_id=self.local_rank,
+                cpu_offload=CPUOffload(offload_params=False),
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                sync_module_states=True,
+                limit_all_gathers=True,  # Memory optimization
             )
         
         self.logger.info(f"Model setup complete. Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -411,6 +429,12 @@ class LLaDATTSTrainer:
         self.text_dataset, self.tts_dataset, self.combined_dataset = create_tts_datasets(
             self.config, self.tokenizer
         )
+        
+        # Calculate max_steps if not already set
+        if self.config.max_steps is None:
+            dataset_size = len(self.combined_dataset)
+            self.config.max_steps = self.config.calculate_max_steps(dataset_size)
+            self.logger.info(f"Calculated max_steps: {self.config.max_steps} (from {self.config.epochs} epochs over {dataset_size} examples)")
         
         # Log dataset information
         if self.config.ratio == 0.0:
@@ -738,7 +762,12 @@ class LLaDATTSTrainer:
                 # Save checkpoint
                 if global_step % self.config.save_steps == 0:
                     checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{global_step}")
-                    self.save_model(checkpoint_dir, global_step)
+                    self.logger.info(f"Saving checkpoint at step {global_step} to {checkpoint_dir}")
+                    try:
+                        self.save_model(checkpoint_dir, global_step)
+                        self.logger.info(f"Successfully saved checkpoint-{global_step}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to save checkpoint at step {global_step}: {e}")
                 
                 # Update progress bar
                 progress_bar.set_postfix({

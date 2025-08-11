@@ -328,6 +328,28 @@ class LLaDAForMaskedLM(nn.Module):
         
         return new_embeddings
     
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory efficiency"""
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+        else:
+            # Fallback: set gradient_checkpointing flag
+            self.model.gradient_checkpointing = True
+            if hasattr(self.model, 'layers'):
+                for layer in self.model.layers:
+                    layer.gradient_checkpointing = True
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing"""
+        if hasattr(self.model, 'gradient_checkpointing_disable'):
+            self.model.gradient_checkpointing_disable()
+        else:
+            # Fallback: unset gradient_checkpointing flag
+            self.model.gradient_checkpointing = False
+            if hasattr(self.model, 'layers'):
+                for layer in self.model.layers:
+                    layer.gradient_checkpointing = False
+    
     def get_input_embeddings(self):
         """Get input embeddings"""
         return self.model.embed_tokens

@@ -27,7 +27,8 @@ class TTSConfig:
     learning_rate: float = 5e-4
     batch_size: int = 4
     gradient_accumulation_steps: int = 8
-    max_steps: int = 50000
+    epochs: int = 3
+    max_steps: Optional[int] = None  # Will be calculated from epochs and dataset size
     warmup_steps: int = 1000
     weight_decay: float = 0.1
     max_grad_norm: float = 1.0
@@ -79,7 +80,7 @@ class TTSConfig:
             'ratio': config_dict.get('ratio', 0.5),
             'save_steps': config_dict.get('save_steps', 2000),
             'pad_token_id': config_dict.get('pad_token', 0),
-            'max_steps': config_dict.get('epochs', 1) * 10000,  # Convert epochs to steps estimate
+            'epochs': config_dict.get('epochs', 1),  # Keep epochs for proper calculation
             'lr_scheduler_type': config_dict.get('lr_scheduler_type', 'cosine'),
         }
         
@@ -114,6 +115,13 @@ class TTSConfig:
             tokens.append(f"{self.special_token_prefix}{i}>")
         
         return tokens
+    
+    def calculate_max_steps(self, dataset_size: int) -> int:
+        """Calculate max_steps based on dataset size and training parameters"""
+        steps_per_epoch = dataset_size // (self.batch_size * self.gradient_accumulation_steps * self.number_processes)
+        if steps_per_epoch == 0:  # Handle small datasets
+            steps_per_epoch = 1
+        return self.epochs * steps_per_epoch
     
     def to_pretraining_config(self) -> PretrainingConfig:
         """Convert to PretrainingConfig for pre-training phase"""

@@ -26,7 +26,6 @@ regex>=2021.8.3
 setuptools>=65.0.0
 
 # TTS-specific dependencies
-fairseq>=0.12.2
 librosa>=0.9.0
 soundfile>=0.12.0
 phonemizer>=3.2.0

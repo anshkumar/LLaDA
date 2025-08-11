@@ -61,6 +61,7 @@ def main():
     parser.add_argument("--batch_size", type=int, help="Override batch size")
     parser.add_argument("--learning_rate", type=float, help="Override learning rate")
     parser.add_argument("--max_steps", type=int, help="Override max steps")
+    parser.add_argument("--force_save", action="store_true", help="Force save checkpoint immediately")
     parser.add_argument("--ratio", type=float, help="Override text/TTS ratio")
     parser.add_argument("--wandb_project", type=str, help="Override wandb project")
     parser.add_argument("--wandb_run_name", type=str, help="Override wandb run name")
@@ -76,7 +77,16 @@ def main():
     setup_logging(args.log_level)
     set_seed(args.seed)
     
+    # Set memory optimization environment variables
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # Allow async CUDA ops
+    
     logger = logging.getLogger(__name__)
+    
+    # Clear CUDA cache at start if available
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info("🧹 Cleared CUDA cache at startup")
     
     # Create sample config if requested
     if args.create_sample_config:
