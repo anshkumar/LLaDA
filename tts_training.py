@@ -776,7 +776,7 @@ class LLaDATTSTrainer:
                             loss_type = "audio" if self.config.ratio == 0.0 else metrics.get('loss_type', 'unknown')
                             current_step = self.audio_step if self.config.ratio == 0.0 else (self.text_step if metrics.get('loss_type') == 'text' else self.audio_step)
                             ppl = torch.exp(torch.tensor(metrics['loss'])).item()
-                            self.logger.info(f"Epoch {epoch + 1}, Step {current_step}: loss={metrics['loss']:.4f}, ppl={ppl:.2f}, masked_tokens={metrics.get('masked_tokens', 'N/A')}")
+                            self.logger.info(f"Epoch {epoch + 1}, Step {current_step}: loss={metrics['loss']:.4f}, ppl={ppl:.2f}, masked_tokens={metrics.get('num_masked_tokens', 'N/A')}")
                             
                             self.log_metrics(metrics, global_step, epoch)
                 
