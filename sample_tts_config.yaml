@@ -5,8 +5,10 @@ TTS_dataset: "/workspace/combined_tts_dataset_pretrain"
 voice_type: "all"
 
 # Model configuration
-model_name: "meta-llama/Llama-3.2-3B-Instruct"
-tokenizer_name: "meta-llama/Llama-3.2-3B-Instruct"
+model_name: "meta-llama/Llama-3.2-1B-Instruct"
+tokenizer_name: "meta-llama/Llama-3.2-1B-Instruct"
+# model_name: "canopylabs/3b-hi-pretrain-research_release"
+# tokenizer_name: "canopylabs/3b-hi-pretrain-research_release"
 
 # Training arguments - Memory optimized for H100 80GB
 epochs: 10
