@@ -483,7 +483,7 @@ class LLaDATTSTrainer:
         Compute loss for mixed text/TTS data
         """
         input_ids = batch["input_ids"].to(self.device)
-        attention_mask = batch["attention_mask"].to(self.device)
+        # Note: attention_mask removed - not needed for FlashAttention-only LLaDA
         data_types = batch.get("data_types", [])
         
         # Determine if this is a TTS batch
@@ -492,18 +492,18 @@ class LLaDATTSTrainer:
         if is_tts_batch and "prompt_lengths" in batch:
             # TTS data - use SFT-style training with prompt masking
             prompt_lengths = batch["prompt_lengths"].to(self.device)
-            return self._compute_sft_loss(input_ids, prompt_lengths, attention_mask)
+            return self._compute_sft_loss(input_ids, prompt_lengths)
         else:
             # Text data - use standard pre-training
-            return self._compute_pretraining_loss(input_ids, attention_mask)
+            return self._compute_pretraining_loss(input_ids)
     
-    def _compute_pretraining_loss(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _compute_pretraining_loss(self, input_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute pre-training loss for text data"""
         # Apply forward diffusion process
         noisy_batch, masked_indices, p_mask = forward_process(input_ids, eps=self.config.eps)
         
         # Forward pass through model
-        outputs = self.model(input_ids=noisy_batch, attention_mask=attention_mask)
+        outputs = self.model(input_ids=noisy_batch)
         logits = outputs.logits
         
         # Compute loss only on masked tokens
@@ -541,7 +541,7 @@ class LLaDATTSTrainer:
             "loss_type": "pretraining"
         }
     
-    def _compute_sft_loss(self, input_ids: torch.Tensor, prompt_lengths: torch.Tensor, attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _compute_sft_loss(self, input_ids: torch.Tensor, prompt_lengths: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute SFT loss for TTS data"""
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -565,7 +565,7 @@ class LLaDATTSTrainer:
         masked_indices = (noisy_batch == self.config.mask_token_id)
         
         # Forward pass through model
-        outputs = self.model(input_ids=noisy_batch, attention_mask=attention_mask)
+        outputs = self.model(input_ids=noisy_batch)
         logits = outputs.logits
         
         # Compute loss only on masked tokens

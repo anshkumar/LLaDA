@@ -5,7 +5,7 @@ from transformers import LlamaConfig, LlamaModel, LlamaForCausalLM
 from transformers.models.llama.modeling_llama import LlamaAttention, LlamaDecoderLayer, LlamaRMSNorm
 from typing import Optional, Tuple, Union
 import math
-
+from flash_attn import flash_attn_func
 
 class LLaDAAttention(nn.Module):
     """Modified LLaMA attention without causal masking for LLaDA"""
@@ -80,10 +80,8 @@ class LLaDAAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -94,79 +92,110 @@ class LLaDAAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
         
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # Reshape for multi-head attention
+        # FlashAttention expects (batch, seqlen, nheads, headdim)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         
-        kv_seq_len = key_states.shape[-2]
+        # Apply RoPE - need to transpose for apply_rotary_pos_emb function
+        query_states_rope = query_states.transpose(1, 2)  # (bsz, num_heads, q_len, head_dim)
+        key_states_rope = key_states.transpose(1, 2)      # (bsz, num_kv_heads, q_len, head_dim)
+        
+        kv_seq_len = key_states.shape[1]
         if past_key_value is not None:
-            # Handle both tuple and cache object formats
-            if hasattr(past_key_value, '__getitem__') and len(past_key_value) > 0:
-                try:
-                    kv_seq_len += past_key_value[0].shape[-2]
-                except (IndexError, KeyError):
-                    # Cache is empty or invalid, ignore it
-                    past_key_value = None
-            else:
-                past_key_value = None
+            kv_seq_len += past_key_value[0].shape[2]  # past_key_value is in (batch, heads, seqlen, headdim)
         
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        query_states_rope, key_states_rope = apply_rotary_pos_emb(query_states_rope, key_states_rope, cos, sin, position_ids)
         
-        if past_key_value is not None:
-            try:
-                key_states = torch.cat([past_key_value[0], key_states], dim=2)
-                value_states = torch.cat([past_key_value[1], value_states], dim=2)
-            except (IndexError, KeyError):
-                # If cache access fails, continue without past states
-                past_key_value = None
+        # Convert back to FlashAttention format
+        query_states = query_states_rope.transpose(1, 2)  # (bsz, q_len, num_heads, head_dim)
+        key_states = key_states_rope.transpose(1, 2)      # (bsz, q_len, num_kv_heads, head_dim)
         
-        past_key_value = (key_states, value_states) if use_cache else None
+        # Ensure tensors are in the correct dtype for FlashAttention
+        flash_dtype = torch.bfloat16 if query_states.device.type == 'cuda' else torch.float16
+        if query_states.dtype not in (torch.float16, torch.bfloat16):
+            query_states = query_states.to(flash_dtype)
+            key_states = key_states.to(flash_dtype)
+            value_states = value_states.to(flash_dtype)
         
-        # Repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-        
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
+        # 🚀 FlashAttention-Only Implementation
+        if self.training and not use_cache:
+            # Training: Standard FlashAttention            
+            attn_output = flash_attn_func(
+                q=query_states,                    # (batch, seqlen, 24, 128)
+                k=key_states,                      # (batch, seqlen, 8, 128) 
+                v=value_states,                    # (batch, seqlen, 8, 128)
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                softmax_scale=1.0 / math.sqrt(self.head_dim),
+                causal=False,                      # 🎯 Non-causal for LLaDA!
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                deterministic=False
             )
+            
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            attn_output = self.o_proj(attn_output)
+            
+            # FlashAttention doesn't return attention weights
+            return attn_output, None
         
-        # Apply attention mask (but NO causal mask for LLaDA)
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
-        
-        # Upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
-        
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
+        elif not use_cache:
+            # Inference without cache: Standard FlashAttention            
+            attn_output = flash_attn_func(
+                q=query_states,
+                k=key_states,
+                v=value_states,
+                dropout_p=0.0,
+                softmax_scale=1.0 / math.sqrt(self.head_dim),
+                causal=False,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                deterministic=True
             )
+            
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            attn_output = self.o_proj(attn_output)
+            
+            # FlashAttention doesn't return attention weights
+            return attn_output, None
         
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-        
-        attn_output = self.o_proj(attn_output)
-        
-        if not output_attentions:
-            attn_weights = None
-        
-        # For training, only return 2 values to match Llama layer expectations
-        if use_cache:
-            return attn_output, attn_weights, past_key_value
         else:
-            return attn_output, attn_weights
+            # Inference with cache: Use simple concatenation + FlashAttention            
+            if past_key_value is not None:
+                # past_key_value is in (batch, heads, seqlen, headdim) format
+                past_k = past_key_value[0].transpose(1, 2)  # Convert to (batch, seqlen, heads, headdim)
+                past_v = past_key_value[1].transpose(1, 2)
+                
+                # Concatenate past and current
+                key_states = torch.cat([past_k, key_states], dim=1)
+                value_states = torch.cat([past_v, value_states], dim=1)
+            
+            # Run FlashAttention on the full sequence
+            attn_output = flash_attn_func(
+                q=query_states,
+                k=key_states,
+                v=value_states,
+                dropout_p=0.0,
+                softmax_scale=1.0 / math.sqrt(self.head_dim),
+                causal=False,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                deterministic=True
+            )
+            
+            # Update cache for next iteration
+            new_past_key_value = (
+                key_states.transpose(1, 2),    # Convert back to (batch, heads, seqlen, headdim)
+                value_states.transpose(1, 2)
+            )
+            
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            attn_output = self.o_proj(attn_output)
+            
+            # FlashAttention doesn't return attention weights
+            return attn_output, None, new_past_key_value
 
 
 class LLaDADecoderLayer(LlamaDecoderLayer):
@@ -184,6 +213,30 @@ class LLaDAModel(LlamaModel):
         super().__init__(config)
         self.layers = nn.ModuleList(
             [LLaDADecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+    
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,  # Catch any legacy parameters like attention_mask, output_attentions
+    ):
+        # Call parent forward but remove unsupported parameters
+        return super().forward(
+            input_ids=input_ids,
+            attention_mask=None,  # Not supported in FlashAttention-only mode
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=False,  # Not supported in FlashAttention-only mode
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
         )
 
 
@@ -212,32 +265,27 @@ class LLaDAForMaskedLM(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,  # Catch any legacy parameters like attention_mask, output_attentions
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        # Decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        # Force use_cache=False for training to avoid cache issues
+        # FlashAttention-only implementation - simplified parameters
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,  # Don't use past key values for training
             inputs_embeds=inputs_embeds,
             use_cache=False,  # Always False for training
-            output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
@@ -249,7 +297,7 @@ class LLaDAForMaskedLM(nn.Module):
         return type('ModelOutput', (), {
             'logits': logits,
             'hidden_states': outputs.hidden_states if output_hidden_states else None,
-            'attentions': outputs.attentions if output_attentions else None,
+            'attentions': None,  # FlashAttention doesn't return attention weights
         })()
     
     def post_init(self):
@@ -367,17 +415,7 @@ class LLaDAForMaskedLM(nn.Module):
         self.lm_head = new_embeddings
 
 
-# Helper functions from transformers library
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+# Helper functions for RoPE (still needed for positional embeddings)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):

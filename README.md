@@ -398,6 +398,41 @@ Grouping:
 
 This architecture enables LLaDA to excel at masked language modeling tasks while being memory-efficient through GQA and supporting both text and audio token sequences for TTS applications.
 
+### Performance Optimizations
+
+#### FlashAttention-3 Integration (H100 Optimized)
+
+LLaDA includes native FlashAttention-3 support, specifically optimized for H100 GPUs:
+
+- **Training**: Uses `flash_attn_func` with non-causal attention and GQA support
+- **Inference**: Uses `flash_attn_with_kvcache` for efficient incremental generation
+- **Memory Savings**: Up to 3x reduction in attention memory usage
+- **Speed**: Significantly faster attention computation on modern hardware
+
+**Key Features:**
+```python
+# Non-causal attention for bidirectional processing
+causal=False
+
+# Native GQA support (24 Q heads, 8 KV heads)
+# FlashAttention handles head grouping automatically
+
+# Optimized for H100 with FlashAttention-3
+deterministic=False  # Training (faster)
+deterministic=True   # Inference (reproducible)
+```
+
+**Installation:**
+```bash
+# FlashAttention-3 for H100
+pip install flash-attn --no-build-isolation
+
+# Verify installation
+python -c "from flash_attn import flash_attn_func; print('✅ FlashAttention ready')"
+```
+
+The system automatically falls back to standard PyTorch attention if FlashAttention is not available.
+
 ## Installation
 
 1. Clone the repository:
@@ -823,3 +858,4 @@ LLaDA/
 ├── requirements.txt        # Dependencies
 └── README.md              # This file
 ```
+ 

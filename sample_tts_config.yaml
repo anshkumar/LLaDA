@@ -20,6 +20,11 @@ lr_scheduler_type: "linear"
 max_grad_norm: 1.0
 max_length: 2048
 
+# Performance optimizations (essential for H100 + FlashAttention)
+bf16: true  # Required for FlashAttention acceleration on H100
+gradient_checkpointing: true  # Memory optimization
+compile_model: false  # Can enable for PyTorch 2.0+ if desired
+
 # Naming and paths
 save_folder: "checkpoints_llada_tts"
 project_name: "llada-tts-experiment"
