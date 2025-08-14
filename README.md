@@ -856,6 +856,13 @@ LLaDA/
 ├── train_llada_tts.py      # TTS training script
 ├── sample_tts_config.yaml  # Sample TTS configuration
 ├── requirements.txt        # Dependencies
-└── README.md              # This file
+├── README.md              # This file
+└── inference/             # 🎵 TTS Inference Package
+    ├── __init__.py            # Package initialization
+    ├── llada_inference.py     # Core inference engine with SNAC
+    ├── llada_api_server.py    # FastAPI REST server
+    ├── example_inference.py   # Usage examples and tutorials
+    ├── test_api_client.py     # API testing client
+    └── README.md             # Inference documentation
 ```
  

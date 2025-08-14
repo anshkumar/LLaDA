@@ -30,4 +30,14 @@ librosa>=0.9.0
 soundfile>=0.12.0
 phonemizer>=3.2.0
 unidecode>=1.3.0 
-flash-attn>=0.3.0
+flash-attn>=2.3.0
+
+# Inference dependencies
+onnxruntime>=1.16.0
+onnxruntime-gpu>=1.16.0  # For GPU acceleration
+
+# API server dependencies
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.4.0
+python-multipart>=0.0.6

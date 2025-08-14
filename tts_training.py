@@ -486,16 +486,23 @@ class LLaDATTSTrainer:
         # Note: attention_mask removed - not needed for FlashAttention-only LLaDA
         data_types = batch.get("data_types", [])
         
-        # Determine if this is a TTS batch
-        is_tts_batch = any(dt == 'tts' for dt in data_types)
-        
-        if is_tts_batch and "prompt_lengths" in batch:
-            # TTS data - use SFT-style training with prompt masking
-            prompt_lengths = batch["prompt_lengths"].to(self.device)
-            return self._compute_sft_loss(input_ids, prompt_lengths)
-        else:
-            # Text data - use standard pre-training
+        # Determine training approach based on training_mode config
+        if self.config.training_mode == "pretraining":
+            # Always use pretraining loss regardless of data type
             return self._compute_pretraining_loss(input_ids)
+        elif self.config.training_mode == "sft":
+            # Use SFT loss for TTS data, pretraining loss for text data
+            is_tts_batch = any(dt == 'tts' for dt in data_types)
+            
+            if is_tts_batch and "prompt_lengths" in batch:
+                # TTS data - use SFT-style training with prompt masking
+                prompt_lengths = batch["prompt_lengths"].to(self.device)
+                return self._compute_sft_loss(input_ids, prompt_lengths)
+            else:
+                # Text data - use standard pre-training
+                return self._compute_pretraining_loss(input_ids)
+        else:
+            raise ValueError(f"Unknown training_mode: {self.config.training_mode}. Use 'pretraining' or 'sft'")
     
     def _compute_pretraining_loss(self, input_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute pre-training loss for text data"""
@@ -728,6 +735,7 @@ class LLaDATTSTrainer:
     def train(self):
         """Main training loop using epochs"""
         self.logger.info(f"Starting TTS training with {len(self.combined_dataset)} examples for {self.config.epochs} epochs")
+        self.logger.info(f"🎯 Training mode: {self.config.training_mode.upper()}")
         
         global_step = 0
         

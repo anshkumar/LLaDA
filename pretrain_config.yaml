@@ -1,0 +1,41 @@
+# Pre-training Configuration for LLaDA TTS
+# Run this BEFORE SFT for better results
+
+# Dataset configuration
+TTS_dataset: "/workspace/combined_tts_dataset_pretrain"
+# text_QA_dataset: "/path/to/your/text/dataset"  # Add if you have text data
+
+voice_type: "all"
+
+# Model configuration
+model_name: "meta-llama/Llama-3.2-1B-Instruct"
+tokenizer_name: "meta-llama/Llama-3.2-1B-Instruct"
+
+# Pre-training specific settings
+training_mode: "pretraining"  # Use this instead of SFT
+
+# Training arguments - Conservative for pre-training
+epochs: 3  # Start with fewer epochs
+batch_size: 4  # Smaller batch for stability
+gradient_accumulation_steps: 2  # Increase to maintain effective batch size
+number_processes: 4
+pad_token: 128263
+save_epochs: 1
+learning_rate: 5.0e-6  # Even smaller for pre-training stability
+lr_scheduler_type: "cosine"  # Cosine often works better for pre-training
+max_grad_norm: 0.5  # Smaller gradient clipping for stability
+max_length: 1024  # Smaller sequences for pre-training
+
+# Performance optimizations
+bf16: true
+gradient_checkpointing: true
+compile_model: false
+
+# Naming and paths
+save_folder: "checkpoints_llada_pretrain"
+project_name: "llada-pretraining"
+run_name: "llada-pretrain-run-1"
+
+# Pre-training specific
+mask_probability: 0.15  # Standard BERT-like masking
+eps: 1e-3  # Diffusion noise parameter 

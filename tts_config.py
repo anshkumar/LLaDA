@@ -39,6 +39,7 @@ class TTSConfig:
     eps: float = 1e-3
     ratio: float = 0.5  # Ratio of text to audio training (0.0 = TTS only)
     lr_scheduler_type: str = "cosine"  # Learning rate scheduler type
+    training_mode: str = "sft"  # Training mode: "pretraining" or "sft"
     
     # Logging and saving
     logging_steps: int = 100
@@ -80,6 +81,7 @@ class TTSConfig:
             'ratio': config_dict.get('ratio', 0.5),
             'save_steps': config_dict.get('save_steps', 2000),
             'pad_token_id': config_dict.get('pad_token', 0),
+            'training_mode': config_dict.get('training_mode', 'sft'),
             'epochs': config_dict.get('epochs', 1),
             'save_epochs': config_dict.get('save_epochs', 1),  # Save every N epochs
             'warmup_epochs': config_dict.get('warmup_epochs', 0.1),
