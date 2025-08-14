@@ -622,14 +622,14 @@ Each example should contain:
 }
 ```
 
-#### Audio Token Format
-Audio tokens follow the pattern:
-- **Audio tokens**: `<audio_token_0>` to `<audio_token_28671>` (7 codebooks × 4096)
-- **Special tokens**: `<special_token_0>` to `<special_token_9>`
+#### Custom Token Format
+Custom tokens follow the Orpheus TTS pattern:
+- **Custom tokens**: `<custom_token_0>` to `<custom_token_28682>` (includes both audio and special tokens)
+- Total tokens: 7 codebooks × 4096 + 10 special tokens + 1 = 28,683 tokens
 
 Example sequence:
 ```
-"Hello world <audio_token_1234> <audio_token_567> ... <special_token_0>"
+"Hello world <custom_token_1234> <custom_token_567> ... <custom_token_28680>"
 ```
 
 #### Mixed Text + TTS Dataset

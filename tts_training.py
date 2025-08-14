@@ -478,7 +478,7 @@ class LLaDATTSTrainer:
             pin_memory=True if torch.cuda.is_available() else False,
         )
     
-    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def compute_loss(self, batch: Dict[str, torch.Tensor], training_progress: float = None) -> Dict[str, torch.Tensor]:
         """
         Compute loss for mixed text/TTS data
         """
@@ -489,7 +489,7 @@ class LLaDATTSTrainer:
         # Determine training approach based on training_mode config
         if self.config.training_mode == "pretraining":
             # Always use pretraining loss regardless of data type
-            return self._compute_pretraining_loss(input_ids)
+            return self._compute_pretraining_loss(input_ids, training_progress)
         elif self.config.training_mode == "sft":
             # Use SFT loss for TTS data, pretraining loss for text data
             is_tts_batch = any(dt == 'tts' for dt in data_types)
@@ -497,17 +497,25 @@ class LLaDATTSTrainer:
             if is_tts_batch and "prompt_lengths" in batch:
                 # TTS data - use SFT-style training with prompt masking
                 prompt_lengths = batch["prompt_lengths"].to(self.device)
-                return self._compute_sft_loss(input_ids, prompt_lengths)
+                return self._compute_sft_loss(input_ids, prompt_lengths, training_progress)
             else:
                 # Text data - use standard pre-training
-                return self._compute_pretraining_loss(input_ids)
+                return self._compute_pretraining_loss(input_ids, training_progress)
         else:
             raise ValueError(f"Unknown training_mode: {self.config.training_mode}. Use 'pretraining' or 'sft'")
     
-    def _compute_pretraining_loss(self, input_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Compute pre-training loss for text data"""
-        # Apply forward diffusion process
-        noisy_batch, masked_indices, p_mask = forward_process(input_ids, eps=self.config.eps)
+    def _compute_pretraining_loss(self, input_ids: torch.Tensor, training_progress: float = None) -> Dict[str, torch.Tensor]:
+        """Compute pre-training loss with TTS-aware masking (only mask audio tokens)"""
+        # Import TTS-aware forward process
+        from tts_forward_process import tts_forward_process, analyze_tts_masking
+        
+        # Apply TTS-aware forward diffusion process (only mask audio tokens)
+        noisy_batch, masked_indices, p_mask = tts_forward_process(
+            input_ids, 
+            eps=self.config.eps,
+            training_progress=training_progress,
+            use_linear_schedule=getattr(self.config, 'use_linear_masking_schedule', True)
+        )
         
         # Forward pass through model
         outputs = self.model(input_ids=noisy_batch)
@@ -530,8 +538,13 @@ class LLaDATTSTrainer:
         # Compute cross-entropy loss
         token_loss = F.cross_entropy(masked_logits, masked_targets, reduction='none')
         
-        # Weight by inverse masking probability
-        weighted_token_loss = token_loss / masked_p_mask
+        # Weight by inverse masking probability (optional)
+        if self.config.use_weighted_loss:
+            weighted_token_loss = token_loss / masked_p_mask
+            self.logger.debug(f"Using weighted loss (1/p_mask)")
+        else:
+            weighted_token_loss = token_loss
+            self.logger.debug(f"Using unweighted loss")
         
         # Average loss
         loss = weighted_token_loss.sum() / (input_ids.shape[0] * input_ids.shape[1])
@@ -541,35 +554,106 @@ class LLaDATTSTrainer:
             num_masked_tokens = masked_indices.sum()
             perplexity = torch.exp(token_loss.mean()) if len(token_loss) > 0 else torch.tensor(float('inf'))
         
+        # Collect additional debugging info
+        debug_info = {}
+        
+        # Add TTS masking analysis
+        if num_masked_tokens > 0:
+            masking_analysis = analyze_tts_masking(input_ids, masked_indices=masked_indices)
+            debug_info.update({
+                "masking_analysis": masking_analysis,
+                "audio_mask_percentage": masking_analysis["audio_mask_rate"],
+                "text_mask_percentage": masking_analysis["text_mask_rate"],
+                "correctly_targeted_masking": masking_analysis["correctly_targeted"]
+            })
+        
+        # Sample predictions for logging (more comprehensive sampling)
+        with torch.no_grad():
+            if num_masked_tokens > 0:
+                # Get predictions
+                masked_predictions = torch.argmax(masked_logits, dim=-1)
+                
+                # Sample more tokens for better analysis (up to 50 tokens)
+                sample_size = min(50, len(masked_targets))
+                debug_info.update({
+                    "sample_targets": masked_targets[:sample_size].cpu().tolist(),
+                    "sample_predictions": masked_predictions[:sample_size].cpu().tolist(),
+                    "sample_probabilities": torch.softmax(masked_logits[:sample_size], dim=-1).max(dim=-1)[0].cpu().tolist(),
+                    "sample_p_mask": masked_p_mask[:sample_size].cpu().tolist()
+                })
+                
+                # Token type analysis (hardcoded SNAC constants)
+                TOKENISER_LENGTH = 128256
+                vocab_size = TOKENISER_LENGTH  # Use hardcoded base vocab size
+                audio_token_start = vocab_size  # Audio tokens start after base vocab
+                
+                # Count token types in targets
+                text_tokens = (masked_targets < vocab_size).sum().item()
+                custom_tokens = (masked_targets >= vocab_size).sum().item()
+                
+                # Count token types in predictions  
+                pred_text_tokens = (masked_predictions < vocab_size).sum().item()
+                pred_custom_tokens = (masked_predictions >= vocab_size).sum().item()
+                
+                debug_info.update({
+                    "target_text_tokens": text_tokens,
+                    "target_custom_tokens": custom_tokens,
+                    "pred_text_tokens": pred_text_tokens, 
+                    "pred_custom_tokens": pred_custom_tokens,
+                    "text_token_ratio": text_tokens / num_masked_tokens.item() if num_masked_tokens > 0 else 0,
+                    "custom_token_ratio": custom_tokens / num_masked_tokens.item() if num_masked_tokens > 0 else 0
+                })
+
         return {
             "loss": loss,
             "num_masked_tokens": num_masked_tokens,
             "perplexity": perplexity,
-            "loss_type": "pretraining"
+            "loss_type": "pretraining",
+            **debug_info
         }
     
-    def _compute_sft_loss(self, input_ids: torch.Tensor, prompt_lengths: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Compute SFT loss for TTS data"""
+    def _compute_sft_loss(self, input_ids: torch.Tensor, prompt_lengths: torch.Tensor, training_progress: float = None) -> Dict[str, torch.Tensor]:
+        """Compute SFT loss for TTS data with TTS-aware masking"""
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        # Apply forward diffusion process
-        noisy_batch, _, p_mask = forward_process(input_ids, eps=self.config.eps)
+        # Import TTS-aware forward process
+        from tts_forward_process import tts_forward_process, analyze_tts_masking
         
-        # Do not add noise to the prompt (key difference from pre-training)
-        token_positions = torch.arange(seq_len, device=device).expand(batch_size, seq_len)
-        prompt_mask = (token_positions < prompt_lengths.unsqueeze(1))
+        # Apply TTS-aware forward diffusion process (only mask audio tokens)
+        noisy_batch, masked_indices, p_mask = tts_forward_process(
+            input_ids, 
+            eps=self.config.eps,
+            training_progress=training_progress,
+            use_linear_schedule=getattr(self.config, 'use_linear_masking_schedule', True)
+        )
         
-        # Restore original tokens for prompt positions
-        noisy_batch[prompt_mask] = input_ids[prompt_mask]
+        # For SFT, we DON'T need to restore prompt tokens because TTS-aware masking
+        # already ensures that only audio tokens are masked (never text/prompt tokens)
         
-        # Calculate answer lengths (including padded tokens)
-        prompt_mask_int = prompt_mask.to(torch.int64)
-        answer_lengths = torch.sum((1 - prompt_mask_int), dim=-1, keepdim=True)
-        answer_lengths = answer_lengths.repeat(1, seq_len)
+        # Calculate answer lengths using TTS token boundaries (hardcoded SNAC constants)
+        TOKENISER_LENGTH = 128256
+        START_OF_SPEECH = TOKENISER_LENGTH + 1  # 128257
+        END_OF_SPEECH = TOKENISER_LENGTH + 2    # 128258
         
-        # Find masked positions
-        masked_indices = (noisy_batch == self.config.mask_token_id)
+        answer_lengths = torch.zeros((batch_size, seq_len), device=device)
+        
+        for batch_idx in range(batch_size):
+            sequence = input_ids[batch_idx]
+            
+            # Find START_OF_SPEECH and END_OF_SPEECH positions
+            start_speech_positions = (sequence == START_OF_SPEECH).nonzero(as_tuple=True)[0]
+            end_speech_positions = (sequence == END_OF_SPEECH).nonzero(as_tuple=True)[0]
+            
+            if len(start_speech_positions) > 0 and len(end_speech_positions) > 0:
+                start_pos = start_speech_positions[0].item()
+                end_pos = end_speech_positions[0].item()
+                
+                # Answer length is the audio region length
+                audio_length = max(1, end_pos - start_pos - 1)  # Avoid division by zero
+                answer_lengths[batch_idx, :] = audio_length
+        
+        # masked_indices already computed by tts_forward_process
         
         # Forward pass through model
         outputs = self.model(input_ids=noisy_batch)
@@ -593,8 +677,11 @@ class LLaDATTSTrainer:
         # Compute cross-entropy loss
         token_loss = F.cross_entropy(masked_logits, masked_targets, reduction='none')
         
-        # Weight by inverse masking probability
-        weighted_token_loss = token_loss / masked_p_mask
+        # Weight by inverse masking probability (optional)
+        if self.config.use_weighted_loss:
+            weighted_token_loss = token_loss / masked_p_mask
+        else:
+            weighted_token_loss = token_loss
         
         # Normalize by answer length and batch size
         ce_loss = torch.sum(weighted_token_loss / masked_answer_lengths) / batch_size
@@ -604,19 +691,71 @@ class LLaDATTSTrainer:
             num_masked_tokens = masked_indices.sum()
             perplexity = torch.exp(token_loss.mean()) if len(token_loss) > 0 else torch.tensor(float('inf'))
         
+        # Add TTS masking analysis and prediction sampling for SFT too
+        debug_info = {}
+        if num_masked_tokens > 0:
+            masking_analysis = analyze_tts_masking(input_ids, masked_indices=masked_indices)
+            debug_info.update({
+                "audio_mask_percentage": masking_analysis["audio_mask_rate"],
+                "text_mask_percentage": masking_analysis["text_mask_rate"],
+                "correctly_targeted_masking": masking_analysis["correctly_targeted"]
+            })
+            
+            # Sample predictions for logging (same as pretraining)
+            with torch.no_grad():
+                # Get predictions
+                masked_predictions = torch.argmax(masked_logits, dim=-1)
+                
+                # Sample up to 50 tokens for analysis
+                sample_size = min(50, len(masked_targets))
+                debug_info.update({
+                    "sample_targets": masked_targets[:sample_size].cpu().tolist(),
+                    "sample_predictions": masked_predictions[:sample_size].cpu().tolist(),
+                    "sample_probabilities": torch.softmax(masked_logits[:sample_size], dim=-1).max(dim=-1)[0].cpu().tolist(),
+                    "sample_p_mask": masked_p_mask[:sample_size].cpu().tolist()
+                })
+                
+                # Token type analysis (hardcoded SNAC constants)
+                TOKENISER_LENGTH = 128256
+                vocab_size = TOKENISER_LENGTH  # Use hardcoded base vocab size
+                
+                # Count token types in targets
+                text_tokens = (masked_targets < vocab_size).sum().item()
+                custom_tokens = (masked_targets >= vocab_size).sum().item()
+                
+                # Count token types in predictions  
+                pred_text_tokens = (masked_predictions < vocab_size).sum().item()
+                pred_custom_tokens = (masked_predictions >= vocab_size).sum().item()
+                
+                debug_info.update({
+                    "target_text_tokens": text_tokens,
+                    "target_custom_tokens": custom_tokens,
+                    "pred_text_tokens": pred_text_tokens, 
+                    "pred_custom_tokens": pred_custom_tokens,
+                    "text_token_ratio": text_tokens / num_masked_tokens.item() if num_masked_tokens > 0 else 0,
+                    "custom_token_ratio": custom_tokens / num_masked_tokens.item() if num_masked_tokens > 0 else 0
+                })
+        
         return {
             "loss": ce_loss,
             "num_masked_tokens": num_masked_tokens,
             "perplexity": perplexity,
-            "loss_type": "sft"
+            "loss_type": "sft",
+            **debug_info
         }
     
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    def train_step(self, batch: Dict[str, torch.Tensor], global_step: int = 0, total_steps: int = 1) -> Dict[str, float]:
         """Single training step"""
         self.model.train()
         
-        # Compute loss
-        loss_dict = self.compute_loss(batch)
+        # Calculate training progress (0.0 to 1.0)
+        training_progress = min(global_step / max(total_steps, 1), 1.0)
+        
+        # Store for logging
+        self._last_training_progress = training_progress
+        
+        # Compute loss with training progress for linear masking schedule
+        loss_dict = self.compute_loss(batch, training_progress)
         loss = loss_dict["loss"]
         
         # Backward pass
@@ -646,15 +785,54 @@ class LLaDATTSTrainer:
                 "global_step": global_step,
                 "learning_rate": self.scheduler.get_last_lr()[0] if hasattr(self.scheduler, 'get_last_lr') else self.config.learning_rate
             }
+            
+            # Add linear masking schedule progress
+            if hasattr(self, '_last_training_progress'):
+                target_mask_pct = self.config.eps + (1.0 - self.config.eps) * self._last_training_progress
+                wandb_metrics["target_masking_percentage"] = target_mask_pct * 100
             if epoch is not None:
                 wandb_metrics["epoch"] = epoch
+            
+            # Add debugging metrics for pretraining
+            if loss_type == "pretraining":
+                debug_metrics = {}
+                for key in ["target_text_tokens", "target_custom_tokens", "pred_text_tokens", "pred_custom_tokens",
+                           "text_token_ratio", "custom_token_ratio", "audio_mask_percentage", "text_mask_percentage", 
+                           "correctly_targeted_masking"]:
+                    if key in metrics:
+                        debug_metrics[f"debug_{key}"] = metrics[key]
+                wandb_metrics.update(debug_metrics)
+            
             if self.config.wandb_project:
                 wandb.log(wandb_metrics, step=global_step)
             
-            self.logger.info(
+            # Enhanced console logging with token analysis
+            console_msg = (
                 f"TTS Step {self.audio_step}: loss={metrics['loss']:.4f}, "
                 f"ppl={metrics['perplexity']:.2f}, masked_tokens={metrics['num_masked_tokens']}"
             )
+            
+            # Add linear masking schedule progress
+            if hasattr(self, '_last_training_progress'):
+                target_mask_pct = self.config.eps + (1.0 - self.config.eps) * self._last_training_progress
+                console_msg += f", target_mask={target_mask_pct:.1%}"
+            
+            if loss_type == "pretraining" and "text_token_ratio" in metrics:
+                console_msg += (
+                    f", text_ratio={metrics['text_token_ratio']:.2f}, "
+                    f"custom_ratio={metrics['custom_token_ratio']:.2f}"
+                )
+                if "audio_mask_percentage" in metrics:
+                    console_msg += f", audio_masked={metrics['audio_mask_percentage']:.1f}%"
+                if "correctly_targeted_masking" in metrics:
+                    console_msg += f", correct_masking={'✅' if metrics['correctly_targeted_masking'] else '❌'}"
+            
+            self.logger.info(console_msg)
+            
+            # Detailed prediction logging at configurable frequency
+            if self.audio_step % self.config.prediction_logging_steps == 0 and "sample_targets" in metrics:
+                self._log_prediction_analysis(metrics, global_step)
+            
             self.audio_step += 1
         else:
             # Mixed training - track steps for different data types
@@ -668,13 +846,34 @@ class LLaDATTSTrainer:
                     "global_step": global_step,
                     "learning_rate": self.scheduler.get_last_lr()[0] if hasattr(self.scheduler, 'get_last_lr') else self.config.learning_rate
                 }
+                
+                # Add SFT masking metrics
+                if loss_type == "sft":
+                    for key in ["audio_mask_percentage", "text_mask_percentage", "correctly_targeted_masking"]:
+                        if key in metrics:
+                            wandb_metrics[f"debug_{key}"] = metrics[key]
+                
                 if self.config.wandb_project:
                     wandb.log(wandb_metrics, step=global_step)
                 
-                self.logger.info(
+                console_msg = (
                     f"Audio Step {self.audio_step}: loss={metrics['loss']:.4f}, "
                     f"ppl={metrics['perplexity']:.2f}, masked_tokens={metrics['num_masked_tokens']}"
                 )
+                
+                # Add SFT masking info to console
+                if loss_type == "sft":
+                    if "audio_mask_percentage" in metrics:
+                        console_msg += f", audio_masked={metrics['audio_mask_percentage']:.1f}%"
+                    if "correctly_targeted_masking" in metrics:
+                        console_msg += f", correct_masking={'✅' if metrics['correctly_targeted_masking'] else '❌'}"
+                
+                self.logger.info(console_msg)
+                
+                # Detailed prediction logging for SFT
+                if self.audio_step % self.config.prediction_logging_steps == 0 and "sample_targets" in metrics:
+                    self._log_prediction_analysis(metrics, global_step)
+                
                 self.audio_step += 1
             else:  # Text batch
                 wandb_metrics = {
@@ -692,6 +891,154 @@ class LLaDATTSTrainer:
                     f"ppl={metrics['perplexity']:.2f}, masked_tokens={metrics['num_masked_tokens']}"
                 )
                 self.text_step += 1
+    
+    def _log_prediction_analysis(self, metrics: Dict[str, Any], global_step: int):
+        """Log detailed prediction vs ground truth analysis to WandB"""
+        if not self.config.wandb_project:
+            return
+            
+        try:
+            import wandb
+            
+            # Create prediction analysis table
+            predictions_data = []
+            
+            targets = metrics.get("sample_targets", [])
+            predictions = metrics.get("sample_predictions", [])
+            probabilities = metrics.get("sample_probabilities", [])
+            p_masks = metrics.get("sample_p_mask", [])
+            
+            # Use hardcoded SNAC constants
+            TOKENISER_LENGTH = 128256
+            vocab_size = TOKENISER_LENGTH
+            
+            for i, (target, pred, prob, p_mask) in enumerate(zip(targets, predictions, probabilities, p_masks)):
+                # Decode tokens to text if possible
+                try:
+                    target_text = self.tokenizer.decode([target]) if target < len(self.tokenizer) else f"<CUSTOM:{target}>"
+                    pred_text = self.tokenizer.decode([pred]) if pred < len(self.tokenizer) else f"<CUSTOM:{pred}>"
+                except:
+                    target_text = f"<UNK:{target}>"
+                    pred_text = f"<UNK:{pred}>"
+                
+                token_type = "text" if target < vocab_size else "custom"
+                pred_type = "text" if pred < vocab_size else "custom"
+                is_correct = target == pred
+                
+                # Calculate token distance for custom tokens
+                token_distance = abs(target - pred) if token_type == "custom" and pred_type == "custom" else None
+                
+                predictions_data.append({
+                    "index": i,
+                    "target_id": target,
+                    "prediction_id": pred,
+                    "target_text": target_text,
+                    "prediction_text": pred_text,
+                    "probability": prob,
+                    "p_mask": p_mask,
+                    "target_type": token_type,
+                    "prediction_type": pred_type,
+                    "is_correct": is_correct,
+                    "type_match": token_type == pred_type,
+                    "token_distance": token_distance if token_distance else 0
+                })
+            
+            # Create WandB table
+            table = wandb.Table(
+                columns=["index", "target_id", "prediction_id", "target_text", "prediction_text", 
+                        "probability", "p_mask", "target_type", "prediction_type", "is_correct", "type_match", "token_distance"],
+                data=[[row[col] for col in ["index", "target_id", "prediction_id", "target_text", "prediction_text", 
+                      "probability", "p_mask", "target_type", "prediction_type", "is_correct", "type_match", "token_distance"]] 
+                      for row in predictions_data]
+            )
+            
+            # Enhanced statistics
+            accuracy = sum(1 for row in predictions_data if row["is_correct"]) / len(predictions_data) if predictions_data else 0
+            type_accuracy = sum(1 for row in predictions_data if row["type_match"]) / len(predictions_data) if predictions_data else 0
+            
+            # Separate analysis for text vs custom tokens
+            text_predictions = [row for row in predictions_data if row["target_type"] == "text"]
+            custom_predictions = [row for row in predictions_data if row["target_type"] == "custom"]
+            
+            text_accuracy = sum(1 for row in text_predictions if row["is_correct"]) / len(text_predictions) if text_predictions else 0
+            custom_accuracy = sum(1 for row in custom_predictions if row["is_correct"]) / len(custom_predictions) if custom_predictions else 0
+            
+            # Average token distance for custom tokens
+            custom_distances = [row["token_distance"] for row in custom_predictions if row["token_distance"] is not None]
+            avg_custom_distance = sum(custom_distances) / len(custom_distances) if custom_distances else 0
+            
+            # Log comprehensive metrics
+            wandb.log({
+                "predictions_table": table,
+                "prediction_accuracy": accuracy,
+                "token_type_accuracy": type_accuracy,
+                "text_token_accuracy": text_accuracy,
+                "custom_token_accuracy": custom_accuracy,
+                "avg_prediction_confidence": sum(row["probability"] for row in predictions_data) / len(predictions_data) if predictions_data else 0,
+                "avg_custom_token_distance": avg_custom_distance,
+                "num_text_predictions": len(text_predictions),
+                "num_custom_predictions": len(custom_predictions),
+                "total_predictions_analyzed": len(predictions_data)
+            }, step=global_step)
+            
+            # Enhanced logging
+            self.logger.info(f"📊 Prediction Analysis (Step {global_step}):")
+            self.logger.info(f"   Overall Accuracy: {accuracy:.3f} ({sum(1 for row in predictions_data if row['is_correct'])}/{len(predictions_data)})")
+            self.logger.info(f"   Type Accuracy: {type_accuracy:.3f}")
+            self.logger.info(f"   Text Token Accuracy: {text_accuracy:.3f} ({len(text_predictions)} samples)")
+            self.logger.info(f"   Custom Token Accuracy: {custom_accuracy:.3f} ({len(custom_predictions)} samples)")
+            if avg_custom_distance > 0:
+                self.logger.info(f"   Avg Custom Token Distance: {avg_custom_distance:.1f}")
+            
+            # Save detailed predictions to file for inspection
+            self._save_predictions_to_file(predictions_data, global_step)
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to log prediction analysis: {e}")
+    
+    def _save_predictions_to_file(self, predictions_data: list, global_step: int):
+        """Save detailed predictions to a text file for manual inspection"""
+        if not self.is_main_process():
+            return
+            
+        try:
+            # Create predictions directory
+            predictions_dir = os.path.join(self.config.output_dir, "predictions")
+            os.makedirs(predictions_dir, exist_ok=True)
+            
+            # Write predictions to file
+            file_path = os.path.join(predictions_dir, f"predictions_step_{global_step}.txt")
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(f"Prediction Analysis - Step {global_step}\n")
+                f.write("=" * 60 + "\n\n")
+                
+                # Group by token type
+                text_preds = [row for row in predictions_data if row["target_type"] == "text"]
+                custom_preds = [row for row in predictions_data if row["target_type"] == "custom"]
+                
+                f.write(f"TEXT TOKEN PREDICTIONS ({len(text_preds)} samples):\n")
+                f.write("-" * 40 + "\n")
+                for row in text_preds:
+                    status = "✅" if row["is_correct"] else "❌"
+                    f.write(f"{status} Target: '{row['target_text']}' ({row['target_id']}) -> Pred: '{row['prediction_text']}' ({row['prediction_id']}) [conf: {row['probability']:.3f}]\n")
+                
+                f.write(f"\nCUSTOM TOKEN PREDICTIONS ({len(custom_preds)} samples):\n")
+                f.write("-" * 40 + "\n")
+                for row in custom_preds:
+                    status = "✅" if row["is_correct"] else "❌"
+                    distance = f" [dist: {row['token_distance']}]" if row['token_distance'] > 0 else ""
+                    f.write(f"{status} Target: {row['target_id']} -> Pred: {row['prediction_id']} [conf: {row['probability']:.3f}]{distance}\n")
+                
+                # Summary
+                f.write(f"\nSUMMARY:\n")
+                f.write(f"Overall Accuracy: {sum(1 for row in predictions_data if row['is_correct'])}/{len(predictions_data)} = {sum(1 for row in predictions_data if row['is_correct'])/len(predictions_data):.3f}\n")
+                f.write(f"Text Accuracy: {sum(1 for row in text_preds if row['is_correct'])}/{len(text_preds)} = {sum(1 for row in text_preds if row['is_correct'])/len(text_preds):.3f}\n" if text_preds else "Text Accuracy: N/A (no text tokens)\n")
+                f.write(f"Custom Accuracy: {sum(1 for row in custom_preds if row['is_correct'])}/{len(custom_preds)} = {sum(1 for row in custom_preds if row['is_correct'])/len(custom_preds):.3f}\n" if custom_preds else "Custom Accuracy: N/A (no custom tokens)\n")
+                
+            self.logger.info(f"💾 Saved detailed predictions to {file_path}")
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to save predictions to file: {e}")
     
     def save_model(self, output_dir: str, step: int, epoch: int = None):
         """Save model checkpoint"""
@@ -738,6 +1085,9 @@ class LLaDATTSTrainer:
         self.logger.info(f"🎯 Training mode: {self.config.training_mode.upper()}")
         
         global_step = 0
+        # Calculate total training steps for linear masking schedule
+        total_steps = self.steps_per_epoch * self.config.epochs
+        self.logger.info(f"📈 Linear masking schedule: 1% → 100% over {total_steps} steps")
         
         # Training loop by epochs
         for epoch in range(self.config.epochs):
@@ -760,8 +1110,8 @@ class LLaDATTSTrainer:
             
             # Training loop for this epoch
             for step, batch in enumerate(progress_bar):
-                # Training step
-                metrics = self.train_step(batch)
+                # Training step with linear masking schedule
+                metrics = self.train_step(batch, global_step, total_steps)
                 
                 # Gradient accumulation
                 if (step + 1) % self.config.gradient_accumulation_steps == 0:

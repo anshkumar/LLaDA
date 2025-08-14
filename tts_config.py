@@ -17,11 +17,10 @@ class TTSConfig:
     text_dataset: str = "text_qa_dataset"
     tts_dataset: str = "tts_dataset"
     
-    # Custom tokens for TTS
+    # Custom tokens for TTS (matching Orpheus format)
     num_audio_tokens: int = 7 * 4096  # 7 codebooks * 4096 vocab size
     num_special_tokens: int = 10  # Additional special tokens
-    audio_token_prefix: str = "<audio_token_"
-    special_token_prefix: str = "<special_token_"
+    custom_token_prefix: str = "<custom_token_"  # Match Orpheus dataset format
     
     # Training parameters
     learning_rate: float = 5e-4
@@ -40,11 +39,14 @@ class TTSConfig:
     ratio: float = 0.5  # Ratio of text to audio training (0.0 = TTS only)
     lr_scheduler_type: str = "cosine"  # Learning rate scheduler type
     training_mode: str = "sft"  # Training mode: "pretraining" or "sft"
+    use_weighted_loss: bool = True  # Whether to weight loss by 1/p_mask (can cause instability)
+    use_linear_masking_schedule: bool = True  # Use linear masking schedule (1% → 100%) instead of random
     
     # Logging and saving
     logging_steps: int = 100
     save_steps: int = 2000
     save_total_limit: int = 3
+    prediction_logging_steps: int = 50  # Log detailed predictions every N steps
     
     # Mixed precision and distributed training
     fp16: bool = True
@@ -84,6 +86,8 @@ class TTSConfig:
             'training_mode': config_dict.get('training_mode', 'sft'),
             'epochs': config_dict.get('epochs', 1),
             'save_epochs': config_dict.get('save_epochs', 1),  # Save every N epochs
+            'prediction_logging_steps': config_dict.get('prediction_logging_steps', 50),
+            'use_weighted_loss': config_dict.get('use_weighted_loss', True),
             'warmup_epochs': config_dict.get('warmup_epochs', 0.1),
             'lr_scheduler_type': config_dict.get('lr_scheduler_type', 'cosine'),
         }
@@ -107,16 +111,14 @@ class TTSConfig:
         return self.num_audio_tokens + self.num_special_tokens
     
     def get_new_token_names(self) -> List[str]:
-        """Generate list of new token names"""
+        """Generate list of new token names matching Orpheus format"""
         tokens = []
         
-        # Audio tokens
-        for i in range(self.num_audio_tokens):
-            tokens.append(f"{self.audio_token_prefix}{i}>")
-        
-        # Special tokens
-        for i in range(self.num_special_tokens):
-            tokens.append(f"{self.special_token_prefix}{i}>")
+        # Generate tokens exactly like Orpheus: <custom_token_0> to <custom_token_28682>
+        # This includes both audio tokens (7*4096=28672) + special tokens (10) + 1 = 28683 total
+        number_add_tokens = self.num_audio_tokens + self.num_special_tokens
+        for i in range(0, number_add_tokens + 1):  # +1 to match Orpheus range
+            tokens.append(f"{self.custom_token_prefix}{i}>")
         
         return tokens
     

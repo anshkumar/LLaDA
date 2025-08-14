@@ -16,7 +16,7 @@ training_mode: "pretraining"  # Use this instead of SFT
 
 # Training arguments - Conservative for pre-training
 epochs: 3  # Start with fewer epochs
-batch_size: 4  # Smaller batch for stability
+batch_size: 2  # Smaller batch for stability
 gradient_accumulation_steps: 2  # Increase to maintain effective batch size
 number_processes: 4
 pad_token: 128263
