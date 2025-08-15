@@ -1,0 +1,1 @@
+torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 train_llada_tts.py --config pretrain_config.yaml

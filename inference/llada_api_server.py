@@ -27,7 +27,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 # Try local import first, then fallback to parent directory
 try:
-    from llada_inference import LLaDAInference, InferenceConfig
+from llada_inference import LLaDAInference, InferenceConfig
 except ImportError:
     from .llada_inference import LLaDAInference, InferenceConfig
 

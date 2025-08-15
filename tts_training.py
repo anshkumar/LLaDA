@@ -18,7 +18,9 @@ from llada_model import LLaDAForMaskedLM
 from pretraining import forward_process
 from tts_config import TTSConfig
 from tts_dataset import create_tts_datasets, tts_data_collator, AlternatingDistributedSampler
-
+from transformers import LlamaConfig, LlamaForCausalLM, AutoModelForCausalLM
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 
 class LLaDATTSTrainer:
     """LLaDA trainer specifically for TTS with mixed text and audio data"""
@@ -70,16 +72,19 @@ class LLaDATTSTrainer:
                 self.rank = dist.get_rank()
                 self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
                 torch.cuda.set_device(self.local_rank)
+                self.use_data_parallel = False
                 
                 print(f"🔧 Distributed training initialized: rank {self.rank}/{self.world_size}, local_rank {self.local_rank}")
             else:
-                # Single-node multi-GPU without torchrun - use DataParallel instead
+                # Single-node multi-GPU without torchrun - just use GPU 0 and warn
                 self.world_size = 1
                 self.rank = 0
                 self.local_rank = 0
-                self.use_data_parallel = True
+                self.use_data_parallel = False
                 
-                print(f"🔧 Single-node multi-GPU detected: {torch.cuda.device_count()} GPUs, using DataParallel")
+                print(f"⚠️  Multiple GPUs detected ({torch.cuda.device_count()}) but not using distributed launcher")
+                print(f"💡 For multi-GPU training, use: python run_distributed_tts.py --config your_config.yaml --gpus {torch.cuda.device_count()}")
+                print(f"🔧 Running on single GPU (GPU 0) for now")
         else:
             # Single GPU or CPU
             self.world_size = 1
@@ -117,195 +122,58 @@ class LLaDATTSTrainer:
     def setup_model(self):
         """Setup LLaDA model with resized embeddings"""
         self.logger.info("Setting up LLaDA model")
+                
+        # Try loading as AutoModel first, then LlamaForCausalLM
+        self.logger.info("Attempting to load with AutoModelForCausalLM...")
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            self.config.model_name_or_path,
+            torch_dtype=torch.float32,  # Use float32 to avoid conversion issues
+            device_map="cpu",  # Load on CPU first
+            trust_remote_code=True
+        )
+        self.logger.info("Successfully loaded with AutoModelForCausalLM")
         
-        # Load or create model config
-        from transformers import LlamaConfig
+        # Get and validate config
+        model_config = hf_model.config
+        self.logger.info(f"Loaded model config: {type(model_config)}")
+        self.logger.info(f"Model architecture: {model_config.architectures if hasattr(model_config, 'architectures') else 'unknown'}")
         
-        if os.path.exists(self.config.model_name_or_path):
-            # Try to load from local checkpoint
-            try:
-                if os.path.exists(os.path.join(self.config.model_name_or_path, "config.json")):
-                    # LLaDA checkpoint
-                    model_config = LlamaConfig.from_pretrained(self.config.model_name_or_path)
-                    self.model = LLaDAForMaskedLM(model_config)
-                    
-                    # Try to load model weights
-                    model_path = os.path.join(self.config.model_name_or_path, "pytorch_model.bin")
-                    if os.path.exists(model_path):
-                        state_dict = torch.load(model_path, map_location="cpu")
-                        self.model.load_state_dict(state_dict, strict=False)
-                        self.logger.info(f"Loaded model weights from {model_path}")
-                else:
-                    # Try loading as HuggingFace model and convert
-                    from transformers import LlamaForCausalLM, AutoModelForCausalLM
-                    
-                    # Load HuggingFace model
-                    hf_model = None
-                    try:
-                        hf_model = AutoModelForCausalLM.from_pretrained(
-                            self.config.model_name_or_path,
-                            torch_dtype=torch.float32,
-                            device_map="cpu",
-                            trust_remote_code=True
-                        )
-                    except Exception as e1:
-                        try:
-                            hf_model = LlamaForCausalLM.from_pretrained(
-                                self.config.model_name_or_path,
-                                torch_dtype=torch.float32,
-                                device_map="cpu",
-                                trust_remote_code=True
-                            )
-                        except Exception as e2:
-                            self.logger.error(f"Failed to load local model. AutoModel: {e1}, Llama: {e2}")
-                            raise e2
-                    
-                    model_config = hf_model.config
-                    
-                    # Ensure proper config type
-                    if not isinstance(model_config, LlamaConfig):
-                        llama_config = LlamaConfig(
-                            vocab_size=getattr(model_config, 'vocab_size', 32000),
-                            hidden_size=getattr(model_config, 'hidden_size', 4096),
-                            intermediate_size=getattr(model_config, 'intermediate_size', 11008),
-                            num_hidden_layers=getattr(model_config, 'num_hidden_layers', 32),
-                            num_attention_heads=getattr(model_config, 'num_attention_heads', 32),
-                            num_key_value_heads=getattr(model_config, 'num_key_value_heads', 32),
-                            max_position_embeddings=getattr(model_config, 'max_position_embeddings', 4096),
-                            rms_norm_eps=getattr(model_config, 'rms_norm_eps', 1e-6),
-                            rope_theta=getattr(model_config, 'rope_theta', 10000.0),
-                            attention_bias=getattr(model_config, 'attention_bias', False),
-                            tie_word_embeddings=getattr(model_config, 'tie_word_embeddings', False),
-                        )
-                        model_config = llama_config
-                    
-                    # Create LLaDA model
-                    self.model = LLaDAForMaskedLM(model_config)
-                    
-                    # Copy weights from HuggingFace model
-                    try:
-                        self.model.model.load_state_dict(hf_model.model.state_dict(), strict=False)
-                        self.model.lm_head.load_state_dict(hf_model.lm_head.state_dict(), strict=False)
-                    except Exception as e:
-                        self.logger.warning(f"Error copying weights: {e}")
-                        self._copy_weights_layer_by_layer(hf_model.model, self.model.model)
-                        if hasattr(hf_model, 'lm_head') and hasattr(self.model, 'lm_head'):
-                            self.model.lm_head.weight.data.copy_(hf_model.lm_head.weight.data)
-                    
-                    del hf_model
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                    self.logger.info(f"Converted HuggingFace model from {self.config.model_name_or_path}")
-                    
-            except Exception as e:
-                self.logger.warning(f"Failed to load model from {self.config.model_name_or_path}: {e}")
-                import traceback
-                self.logger.warning(f"Full error traceback: {traceback.format_exc()}")
-                self.logger.info("Initializing model from scratch")
-                model_config = LlamaConfig()
-                self.model = LLaDAForMaskedLM(model_config)
-        else:
-            # Try to download from HuggingFace Hub
-            try:
-                from transformers import LlamaForCausalLM, AutoModelForCausalLM
-                
-                # Try loading as AutoModel first, then LlamaForCausalLM
-                hf_model = None
-                try:
-                    self.logger.info("Attempting to load with AutoModelForCausalLM...")
-                    hf_model = AutoModelForCausalLM.from_pretrained(
-                        self.config.model_name_or_path,
-                        torch_dtype=torch.float32,  # Use float32 to avoid conversion issues
-                        device_map="cpu",  # Load on CPU first
-                        trust_remote_code=True
-                    )
-                    self.logger.info("Successfully loaded with AutoModelForCausalLM")
-                except Exception as e1:
-                    self.logger.warning(f"AutoModelForCausalLM failed: {e1}")
-                    try:
-                        self.logger.info("Attempting to load with LlamaForCausalLM...")
-                        hf_model = LlamaForCausalLM.from_pretrained(
-                            self.config.model_name_or_path,
-                            torch_dtype=torch.float32,
-                            device_map="cpu",
-                            trust_remote_code=True
-                        )
-                        self.logger.info("Successfully loaded with LlamaForCausalLM")
-                    except Exception as e2:
-                        self.logger.error(f"Both loading methods failed. AutoModel error: {e1}, Llama error: {e2}")
-                        raise e2
-                
-                if hf_model is None:
-                    raise ValueError("Failed to load model with any method")
-                
-                # Get and validate config
-                model_config = hf_model.config
-                self.logger.info(f"Loaded model config: {type(model_config)}")
-                self.logger.info(f"Model architecture: {model_config.architectures if hasattr(model_config, 'architectures') else 'unknown'}")
-                
-                # Create LLaDA model with proper config handling
-                try:
-                    # Ensure we have a proper LlamaConfig
-                    if not isinstance(model_config, LlamaConfig):
-                        self.logger.info("Converting config to LlamaConfig...")
-                        # Convert to LlamaConfig if it's not already
-                        llama_config = LlamaConfig(
-                            vocab_size=getattr(model_config, 'vocab_size', 32000),
-                            hidden_size=getattr(model_config, 'hidden_size', 4096),
-                            intermediate_size=getattr(model_config, 'intermediate_size', 11008),
-                            num_hidden_layers=getattr(model_config, 'num_hidden_layers', 32),
-                            num_attention_heads=getattr(model_config, 'num_attention_heads', 32),
-                            num_key_value_heads=getattr(model_config, 'num_key_value_heads', 32),
-                            max_position_embeddings=getattr(model_config, 'max_position_embeddings', 4096),
-                            rms_norm_eps=getattr(model_config, 'rms_norm_eps', 1e-6),
-                            rope_theta=getattr(model_config, 'rope_theta', 10000.0),
-                            attention_bias=getattr(model_config, 'attention_bias', False),
-                            tie_word_embeddings=getattr(model_config, 'tie_word_embeddings', False),
-                        )
-                        model_config = llama_config
-                    
-                    self.model = LLaDAForMaskedLM(model_config)
-                    self.logger.info("Successfully created LLaDA model")
-                    
-                except Exception as e:
-                    self.logger.error(f"Failed to create LLaDA model: {e}")
-                    raise e
-                
-                # Copy weights from HuggingFace model more carefully
-                self.logger.info("Copying model weights...")
-                
-                # Copy the base model weights
-                try:
-                    self.model.model.load_state_dict(hf_model.model.state_dict(), strict=False)
-                    self.logger.info("Successfully copied base model weights")
-                except Exception as e:
-                    self.logger.warning(f"Error copying base model weights: {e}")
-                    # Try copying layer by layer
-                    self._copy_weights_layer_by_layer(hf_model.model, self.model.model)
-                
-                # Copy the language model head
-                try:
-                    self.model.lm_head.load_state_dict(hf_model.lm_head.state_dict(), strict=False)
-                    self.logger.info("Successfully copied lm_head weights")
-                except Exception as e:
-                    self.logger.warning(f"Error copying lm_head weights: {e}")
-                    # Manual copy
-                    if hasattr(hf_model, 'lm_head') and hasattr(self.model, 'lm_head'):
-                        self.model.lm_head.weight.data.copy_(hf_model.lm_head.weight.data)
-                
-                # Clean up HF model to save memory
-                del hf_model
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                
-                self.logger.info(f"Downloaded and converted model from {self.config.model_name_or_path}")
-                
-            except Exception as e:
-                self.logger.warning(f"Failed to download model {self.config.model_name_or_path}: {e}")
-                import traceback
-                self.logger.warning(f"Full error traceback: {traceback.format_exc()}")
-                self.logger.info("Initializing model from scratch")
-                model_config = LlamaConfig()
-                self.model = LLaDAForMaskedLM(model_config)
+        # Create LLaDA model with proper config handling
+        self.logger.info("Converting config to LlamaConfig...")
+        # Convert to LlamaConfig if it's not already
+        llama_config = LlamaConfig(
+            vocab_size=getattr(model_config, 'vocab_size', 32000),
+            hidden_size=getattr(model_config, 'hidden_size', 4096),
+            intermediate_size=getattr(model_config, 'intermediate_size', 11008),
+            num_hidden_layers=getattr(model_config, 'num_hidden_layers', 32),
+            num_attention_heads=getattr(model_config, 'num_attention_heads', 32),
+            num_key_value_heads=getattr(model_config, 'num_key_value_heads', 32),
+            max_position_embeddings=getattr(model_config, 'max_position_embeddings', 4096),
+            rms_norm_eps=getattr(model_config, 'rms_norm_eps', 1e-6),
+            rope_theta=getattr(model_config, 'rope_theta', 10000.0),
+            attention_bias=getattr(model_config, 'attention_bias', False),
+            tie_word_embeddings=getattr(model_config, 'tie_word_embeddings', False),
+        )
+        model_config = llama_config
         
+        self.model = LLaDAForMaskedLM(model_config)
+        self.logger.info("Successfully created LLaDA model")
+
+        # Copy weights from HuggingFace model more carefully
+        self.logger.info("Copying model weights...")
+        self.model.model.load_state_dict(hf_model.model.state_dict(), strict=False)
+        self.logger.info("Successfully copied base model weights")
+        
+        # Copy the language model head
+        self.model.lm_head.load_state_dict(hf_model.lm_head.state_dict(), strict=False)
+        self.logger.info("Successfully copied lm_head weights")
+        
+        # Clean up HF model to save memory
+        del hf_model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        self.logger.info(f"Downloaded and converted model from {self.config.model_name_or_path}")
+                
         # Resize token embeddings for custom tokens
         original_vocab_size = self.model.config.vocab_size
         new_vocab_size = len(self.tokenizer)
@@ -322,87 +190,7 @@ class LLaDATTSTrainer:
         # Move to device with mixed precision
         self.model = self.model.to(device=self.device, dtype=torch.bfloat16)
         self.logger.info("✅ Using bfloat16 mixed precision")
-        
-        # Setup parallel training
-        if self.config.fsdp and self.world_size > 1:
-            # Use FSDP for distributed training
-            from torch.distributed.fsdp import MixedPrecision, CPUOffload, ShardingStrategy
-            from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-            from llada_model import LLaDADecoderLayer
-            
-            self.logger.info("Setting up memory-optimized FSDP")
-            self.model = FSDP(
-                self.model,
-                auto_wrap_policy=ModuleWrapPolicy({LLaDADecoderLayer}),
-                mixed_precision=MixedPrecision(
-                    param_dtype=torch.bfloat16,
-                    reduce_dtype=torch.bfloat16,
-                    buffer_dtype=torch.bfloat16,
-                ),
-                device_id=self.local_rank,
-                cpu_offload=CPUOffload(offload_params=False),
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                sync_module_states=True,
-                limit_all_gathers=True,  # Memory optimization
-            )
-        elif self.use_data_parallel and torch.cuda.device_count() > 1:
-            # Use DataParallel for single-node multi-GPU without distributed setup
-            self.logger.info(f"Setting up DataParallel for {torch.cuda.device_count()} GPUs")
-            self.model = torch.nn.DataParallel(self.model)
-            self.model = self.model.cuda()  # Move to GPU after DataParallel wrapping
-        
         self.logger.info(f"Model setup complete. Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-    
-    def _copy_weights_layer_by_layer(self, source_model, target_model):
-        """Copy weights layer by layer as fallback"""
-        try:
-            # Copy embeddings
-            if hasattr(source_model, 'embed_tokens') and hasattr(target_model, 'embed_tokens'):
-                target_model.embed_tokens.weight.data.copy_(source_model.embed_tokens.weight.data)
-                self.logger.info("Copied embedding weights")
-            
-            # Copy layers
-            if hasattr(source_model, 'layers') and hasattr(target_model, 'layers'):
-                for i, (source_layer, target_layer) in enumerate(zip(source_model.layers, target_model.layers)):
-                    try:
-                        target_layer.load_state_dict(source_layer.state_dict(), strict=False)
-                    except:
-                        # Copy individual components
-                        self._copy_layer_components(source_layer, target_layer)
-                self.logger.info(f"Copied {len(source_model.layers)} layer weights")
-            
-            # Copy norm
-            if hasattr(source_model, 'norm') and hasattr(target_model, 'norm'):
-                target_model.norm.load_state_dict(source_model.norm.state_dict(), strict=False)
-                self.logger.info("Copied norm weights")
-                
-        except Exception as e:
-            self.logger.warning(f"Error in layer-by-layer copying: {e}")
-    
-    def _copy_layer_components(self, source_layer, target_layer):
-        """Copy individual layer components"""
-        try:
-            # Copy attention weights (but not the attention mask logic)
-            if hasattr(source_layer, 'self_attn') and hasattr(target_layer, 'self_attn'):
-                for attr in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-                    if hasattr(source_layer.self_attn, attr) and hasattr(target_layer.self_attn, attr):
-                        getattr(target_layer.self_attn, attr).load_state_dict(
-                            getattr(source_layer.self_attn, attr).state_dict(), strict=False
-                        )
-            
-            # Copy MLP weights
-            if hasattr(source_layer, 'mlp') and hasattr(target_layer, 'mlp'):
-                target_layer.mlp.load_state_dict(source_layer.mlp.state_dict(), strict=False)
-            
-            # Copy layer norms
-            for attr in ['input_layernorm', 'post_attention_layernorm']:
-                if hasattr(source_layer, attr) and hasattr(target_layer, attr):
-                    getattr(target_layer, attr).load_state_dict(
-                        getattr(source_layer, attr).state_dict(), strict=False
-                    )
-                    
-        except Exception as e:
-            self.logger.warning(f"Error copying layer components: {e}")
     
     def setup_optimizer(self):
         """Setup optimizer and scheduler"""
@@ -437,14 +225,12 @@ class LLaDATTSTrainer:
         total_steps = self.steps_per_epoch * self.config.epochs
         
         if self.config.lr_scheduler_type == "cosine":
-            from torch.optim.lr_scheduler import CosineAnnealingLR
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
                 T_max=total_steps,
                 eta_min=self.config.learning_rate * 0.1
             )
         elif self.config.lr_scheduler_type == "constant":
-            from torch.optim.lr_scheduler import LambdaLR
             self.scheduler = LambdaLR(self.optimizer, lambda step: 1.0)
         else:
             # Default to linear warmup
@@ -1138,9 +924,6 @@ class LLaDATTSTrainer:
             
             # Save model state
             torch.save(cpu_state_dict, os.path.join(output_dir, "pytorch_model.bin"))
-        elif isinstance(self.model, torch.nn.DataParallel):
-            # DataParallel model saving - save the underlying module
-            torch.save(self.model.module.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
         else:
             # Regular model saving
             torch.save(self.model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
@@ -1265,38 +1048,3 @@ class LLaDATTSTrainer:
             self.save_model(final_checkpoint_dir, global_step, self.config.epochs)
             self.logger.info(f"Training completed! Final model saved to {final_checkpoint_dir}")
             self.logger.info(f"Total training steps: {global_step}")
-
-
-def main():
-    """Main training function"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="LLaDA TTS Training")
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
-    parser.add_argument("--output_dir", type=str, help="Override output directory")
-    parser.add_argument("--batch_size", type=int, help="Override batch size")
-    parser.add_argument("--learning_rate", type=float, help="Override learning rate")
-    parser.add_argument("--max_steps", type=int, help="Override max steps")
-    
-    args = parser.parse_args()
-    
-    # Load config
-    config = TTSConfig.from_yaml(args.config)
-    
-    # Override with command line arguments
-    if args.output_dir:
-        config.output_dir = args.output_dir
-    if args.batch_size:
-        config.batch_size = args.batch_size
-    if args.learning_rate:
-        config.learning_rate = args.learning_rate
-    if args.max_steps:
-        config.max_steps = args.max_steps
-    
-    # Start training
-    trainer = LLaDATTSTrainer(config)
-    trainer.train()
-
-
-if __name__ == "__main__":
-    main() 
