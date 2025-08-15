@@ -39,8 +39,15 @@ class TTSConfig:
     ratio: float = 0.5  # Ratio of text to audio training (0.0 = TTS only)
     lr_scheduler_type: str = "cosine"  # Learning rate scheduler type
     training_mode: str = "sft"  # Training mode: "pretraining" or "sft"
-    use_weighted_loss: bool = True  # Whether to weight loss by 1/p_mask (can cause instability)
-    use_linear_masking_schedule: bool = True  # Use linear masking schedule (1% → 100%) instead of random
+    use_weighted_loss: bool = False  # Whether to weight loss by 1/p_mask (can cause instability)
+    use_linear_masking_schedule: bool = False  # Use linear masking schedule (1% → 100%) instead of random
+    use_curriculum_learning: bool = True  # Use curriculum learning timestep schedule (CLTS) from diffusion optimization
+    curriculum_target_progress: float = 0.7  # When to fully transition to curriculum learning (0.0-1.0)
+    
+    # Momentum decay optimization for diffusion models
+    use_momentum_decay: bool = True  # Use momentum decay with learning rate compensation (MDLRC)
+    initial_momentum: float = 0.9  # Initial momentum value (β₀)
+    final_momentum: float = 0.5    # Final momentum value
     
     # Logging and saving
     logging_steps: int = 100

@@ -395,12 +395,19 @@ class LLaDATTSTrainer:
             },
         ]
         
+        # Set initial momentum based on config
+        initial_beta1 = getattr(self.config, 'initial_momentum', 0.9)
+        
         self.optimizer = torch.optim.AdamW(
             optimizer_grouped_parameters,
             lr=self.config.learning_rate,
-            betas=(0.9, 0.95),
+            betas=(initial_beta1, 0.95),
             eps=1e-8
         )
+        
+        # Store original learning rate for momentum decay compensation
+        self.original_lr = self.config.learning_rate
+        self.original_beta1 = initial_beta1
         
         # Learning rate scheduler
         total_steps = self.steps_per_epoch * self.config.epochs
@@ -514,7 +521,9 @@ class LLaDATTSTrainer:
             input_ids, 
             eps=self.config.eps,
             training_progress=training_progress,
-            use_linear_schedule=getattr(self.config, 'use_linear_masking_schedule', True)
+            use_linear_schedule=getattr(self.config, 'use_linear_masking_schedule', True),
+            use_curriculum_learning=getattr(self.config, 'use_curriculum_learning', False),
+            curriculum_target_progress=getattr(self.config, 'curriculum_target_progress', 0.8)
         )
         
         # Forward pass through model
@@ -625,7 +634,9 @@ class LLaDATTSTrainer:
             input_ids, 
             eps=self.config.eps,
             training_progress=training_progress,
-            use_linear_schedule=getattr(self.config, 'use_linear_masking_schedule', True)
+            use_linear_schedule=getattr(self.config, 'use_linear_masking_schedule', True),
+            use_curriculum_learning=getattr(self.config, 'use_curriculum_learning', False),
+            curriculum_target_progress=getattr(self.config, 'curriculum_target_progress', 0.8)
         )
         
         # For SFT, we DON'T need to restore prompt tokens because TTS-aware masking
@@ -744,9 +755,38 @@ class LLaDATTSTrainer:
             **debug_info
         }
     
+    def update_momentum_and_lr(self, global_step: int, total_steps: int):
+        """Update momentum and learning rate for momentum decay optimization"""
+        if not getattr(self.config, 'use_momentum_decay', False):
+            return
+            
+        # Calculate training progress
+        tau = min(global_step / max(total_steps, 1), 1.0)
+        
+        # Calculate new momentum (β_t)
+        beta0 = self.original_beta1
+        final_beta = getattr(self.config, 'final_momentum', 0.5)
+        beta_t = final_beta + (beta0 - final_beta) * (1 - tau)
+        
+        # Calculate compensated learning rate
+        lr_compensation = (1 - beta0) / (1 - beta_t)
+        new_lr = self.original_lr * lr_compensation
+        
+        # Update optimizer parameters
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
+            param_group['betas'] = (beta_t, param_group['betas'][1])
+        
+        # Store for logging
+        self._current_momentum = beta_t
+        self._current_lr_compensation = lr_compensation
+
     def train_step(self, batch: Dict[str, torch.Tensor], global_step: int = 0, total_steps: int = 1) -> Dict[str, float]:
         """Single training step"""
         self.model.train()
+        
+        # Update momentum and learning rate for diffusion optimization
+        self.update_momentum_and_lr(global_step, total_steps)
         
         # Calculate training progress (0.0 to 1.0)
         training_progress = min(global_step / max(total_steps, 1), 1.0)
@@ -786,10 +826,21 @@ class LLaDATTSTrainer:
                 "learning_rate": self.scheduler.get_last_lr()[0] if hasattr(self.scheduler, 'get_last_lr') else self.config.learning_rate
             }
             
-            # Add linear masking schedule progress
+            # Add optimization metrics
             if hasattr(self, '_last_training_progress'):
-                target_mask_pct = self.config.eps + (1.0 - self.config.eps) * self._last_training_progress
-                wandb_metrics["target_masking_percentage"] = target_mask_pct * 100
+                if getattr(self.config, 'use_curriculum_learning', False):
+                    # Curriculum learning metrics
+                    wandb_metrics["curriculum_gamma"] = min(self._last_training_progress / getattr(self.config, 'curriculum_target_progress', 0.8), 1.0)
+                elif getattr(self.config, 'use_linear_masking_schedule', True):
+                    # Linear masking schedule
+                    target_mask_pct = self.config.eps + (1.0 - self.config.eps) * self._last_training_progress
+                    wandb_metrics["target_masking_percentage"] = target_mask_pct * 100
+            
+            # Add momentum decay metrics
+            if hasattr(self, '_current_momentum'):
+                wandb_metrics["current_momentum"] = self._current_momentum
+                wandb_metrics["lr_compensation_factor"] = self._current_lr_compensation
+                wandb_metrics["effective_lr"] = self.optimizer.param_groups[0]['lr']
             if epoch is not None:
                 wandb_metrics["epoch"] = epoch
             
@@ -812,10 +863,18 @@ class LLaDATTSTrainer:
                 f"ppl={metrics['perplexity']:.2f}, masked_tokens={metrics['num_masked_tokens']}"
             )
             
-            # Add linear masking schedule progress
+            # Add optimization progress info
             if hasattr(self, '_last_training_progress'):
-                target_mask_pct = self.config.eps + (1.0 - self.config.eps) * self._last_training_progress
-                console_msg += f", target_mask={target_mask_pct:.1%}"
+                if getattr(self.config, 'use_curriculum_learning', False):
+                    gamma = min(self._last_training_progress / getattr(self.config, 'curriculum_target_progress', 0.8), 1.0)
+                    console_msg += f", curriculum_γ={gamma:.2f}"
+                elif getattr(self.config, 'use_linear_masking_schedule', True):
+                    target_mask_pct = self.config.eps + (1.0 - self.config.eps) * self._last_training_progress
+                    console_msg += f", target_mask={target_mask_pct:.1%}"
+            
+            # Add momentum decay info
+            if hasattr(self, '_current_momentum'):
+                console_msg += f", β={self._current_momentum:.3f}"
             
             if loss_type == "pretraining" and "text_token_ratio" in metrics:
                 console_msg += (
@@ -1085,9 +1144,21 @@ class LLaDATTSTrainer:
         self.logger.info(f"🎯 Training mode: {self.config.training_mode.upper()}")
         
         global_step = 0
-        # Calculate total training steps for linear masking schedule
+        # Calculate total training steps for optimization schedules
         total_steps = self.steps_per_epoch * self.config.epochs
-        self.logger.info(f"📈 Linear masking schedule: 1% → 100% over {total_steps} steps")
+        
+        # Log enabled optimization strategies
+        optimizations = []
+        if getattr(self.config, 'use_curriculum_learning', False):
+            optimizations.append(f"📚 Curriculum Learning (CLTS) → focus on harder timesteps over {self.config.curriculum_target_progress:.0%} of training")
+        elif getattr(self.config, 'use_linear_masking_schedule', True):
+            optimizations.append(f"📈 Linear masking: 1% → 100% over {total_steps} steps")
+        
+        if getattr(self.config, 'use_momentum_decay', False):
+            optimizations.append(f"⚡ Momentum decay: β={self.config.initial_momentum:.1f} → {self.config.final_momentum:.1f} with LR compensation")
+        
+        for opt in optimizations:
+            self.logger.info(opt)
         
         # Training loop by epochs
         for epoch in range(self.config.epochs):

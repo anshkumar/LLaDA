@@ -7,7 +7,8 @@ import torch
 
 
 def tts_forward_process(input_ids: torch.Tensor, eps: float = 1e-3, tokenizer_vocab_size: int = None, 
-                       training_progress: float = None, use_linear_schedule: bool = True) -> tuple:
+                       training_progress: float = None, use_linear_schedule: bool = True,
+                       use_curriculum_learning: bool = False, curriculum_target_progress: float = 0.8) -> tuple:
     """
     TTS-aware forward diffusion process for LLaDA
     Only masks audio tokens between START_OF_SPEECH and END_OF_SPEECH
@@ -18,6 +19,8 @@ def tts_forward_process(input_ids: torch.Tensor, eps: float = 1e-3, tokenizer_vo
         eps: Minimum masking probability
         training_progress: Progress through training (0.0 to 1.0). If None, uses random masking
         use_linear_schedule: If True, use linear masking schedule. If False, use original random masking
+        use_curriculum_learning: If True, use curriculum learning timestep schedule (CLTS)
+        curriculum_target_progress: When to fully transition to curriculum learning (0.0-1.0)
     
     Returns:
         noisy_batch: Input with masked audio tokens only
@@ -33,7 +36,33 @@ def tts_forward_process(input_ids: torch.Tensor, eps: float = 1e-3, tokenizer_vo
     END_OF_SPEECH = TOKENISER_LENGTH + 2    # 128258
     MASK_TOKEN_ID = 126336
     
-    if use_linear_schedule and training_progress is not None:
+    if use_curriculum_learning and training_progress is not None:
+        # Curriculum Learning Timestep Schedule (CLTS) from diffusion optimization paper
+        # Gradually shift from uniform sampling to focusing on harder timesteps (lower masking rates)
+        
+        # Calculate curriculum factor: 0 -> 1 over curriculum_target_progress
+        gamma = min(training_progress / curriculum_target_progress, 1.0)
+        
+        if gamma < 1.0:
+            # Mixed distribution: uniform + gaussian focusing on harder timesteps
+            # Sample base timesteps uniformly
+            t_uniform = torch.rand(b, device=device)
+            
+            # Sample from gaussian focused on harder timesteps (lower t values = less masking)
+            # Mean at 0.3 (30% masking), std covers full range
+            t_gaussian = torch.normal(0.3, 0.5, (b,), device=device).clamp(0.0, 1.0)
+            
+            # Mix uniform and gaussian based on training progress
+            t = (1 - gamma) * t_uniform + gamma * t_gaussian
+        else:
+            # Pure curriculum: focus on harder timesteps
+            t = torch.normal(0.3, 0.5, (b,), device=device).clamp(0.0, 1.0)
+        
+        # Calculate masking probability from sampled timesteps
+        p_mask = (1 - eps) * t + eps
+        p_mask = p_mask[:, None].repeat(1, l)  # Shape: (b, l)
+        
+    elif use_linear_schedule and training_progress is not None:
         # Linear masking schedule: increase from eps to 1.0 over training
         # training_progress: 0.0 -> eps (1% masking)
         # training_progress: 1.0 -> 1.0 (100% masking)
