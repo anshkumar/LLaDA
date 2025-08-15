@@ -25,6 +25,7 @@ class LLaDATTSTrainer:
     
     def __init__(self, config: TTSConfig):
         self.config = config
+        self.use_data_parallel = False  # Initialize before setup_distributed
         self.setup_logging()
         self.setup_distributed()
         self.setup_tokenizer()
@@ -59,17 +60,34 @@ class LLaDATTSTrainer:
     def setup_distributed(self):
         """Setup distributed training"""
         if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            if not dist.is_initialized():
-                dist.init_process_group(backend='nccl')
-            
-            self.world_size = dist.get_world_size()
-            self.rank = dist.get_rank()
-            self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
-            torch.cuda.set_device(self.local_rank)
+            # Check if we're in a distributed environment
+            if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+                # Running with torchrun or similar distributed launcher
+                if not dist.is_initialized():
+                    dist.init_process_group(backend='nccl')
+                
+                self.world_size = dist.get_world_size()
+                self.rank = dist.get_rank()
+                self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+                torch.cuda.set_device(self.local_rank)
+                
+                print(f"🔧 Distributed training initialized: rank {self.rank}/{self.world_size}, local_rank {self.local_rank}")
+            else:
+                # Single-node multi-GPU without torchrun - use DataParallel instead
+                self.world_size = 1
+                self.rank = 0
+                self.local_rank = 0
+                self.use_data_parallel = True
+                
+                print(f"🔧 Single-node multi-GPU detected: {torch.cuda.device_count()} GPUs, using DataParallel")
         else:
+            # Single GPU or CPU
             self.world_size = 1
             self.rank = 0
             self.local_rank = 0
+            self.use_data_parallel = False
+            
+            print(f"🔧 Single device training: {'GPU' if torch.cuda.is_available() else 'CPU'}")
         
         self.device = torch.device(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
     
@@ -305,8 +323,9 @@ class LLaDATTSTrainer:
         self.model = self.model.to(device=self.device, dtype=torch.bfloat16)
         self.logger.info("✅ Using bfloat16 mixed precision")
         
-        # Setup FSDP if enabled and multiple GPUs
+        # Setup parallel training
         if self.config.fsdp and self.world_size > 1:
+            # Use FSDP for distributed training
             from torch.distributed.fsdp import MixedPrecision, CPUOffload, ShardingStrategy
             from torch.distributed.fsdp.wrap import ModuleWrapPolicy
             from llada_model import LLaDADecoderLayer
@@ -326,6 +345,11 @@ class LLaDATTSTrainer:
                 sync_module_states=True,
                 limit_all_gathers=True,  # Memory optimization
             )
+        elif self.use_data_parallel and torch.cuda.device_count() > 1:
+            # Use DataParallel for single-node multi-GPU without distributed setup
+            self.logger.info(f"Setting up DataParallel for {torch.cuda.device_count()} GPUs")
+            self.model = torch.nn.DataParallel(self.model)
+            self.model = self.model.cuda()  # Move to GPU after DataParallel wrapping
         
         self.logger.info(f"Model setup complete. Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
     
@@ -1114,6 +1138,9 @@ class LLaDATTSTrainer:
             
             # Save model state
             torch.save(cpu_state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+        elif isinstance(self.model, torch.nn.DataParallel):
+            # DataParallel model saving - save the underlying module
+            torch.save(self.model.module.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
         else:
             # Regular model saving
             torch.save(self.model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))

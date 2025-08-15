@@ -37,7 +37,7 @@ def tts_forward_process(input_ids: torch.Tensor, eps: float = 1e-3, tokenizer_vo
     MASK_TOKEN_ID = 126336
     
     if use_curriculum_learning and training_progress is not None:
-        # Curriculum Learning Timestep Schedule (CLTS) from diffusion optimization paper
+        # Curriculum Learning Timestep Schedule (CLTS) from https://arxiv.org/html/2404.07946v1 paper
         # Gradually shift from uniform sampling to focusing on harder timesteps (lower masking rates)
         
         # Calculate curriculum factor: 0 -> 1 over curriculum_target_progress
