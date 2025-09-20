@@ -29,11 +29,25 @@ import sys
 import argparse
 import logging
 import torch
+import signal
 from transformers import set_seed
 
 # Import our TTS modules
 from tts_config import TTSConfig, create_sample_tts_config
 from tts_training import LLaDATTSTrainer
+
+# Global trainer instance for signal handling
+trainer_instance = None
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C signal for graceful shutdown and checkpointing."""
+    global trainer_instance
+    if trainer_instance:
+        print("\nCaught Ctrl+C. Saving checkpoint before exiting...")
+        checkpoint_dir = os.path.join(trainer_instance.config.output_dir, "interrupt_checkpoint")
+        trainer_instance.save_checkpoint(checkpoint_dir, is_interrupt=True)
+    print("Exiting.")
+    sys.exit(0)
 
 
 def setup_logging(level: str = "INFO"):
@@ -61,7 +75,7 @@ def main():
     parser.add_argument("--batch_size", type=int, help="Override batch size")
     parser.add_argument("--learning_rate", type=float, help="Override learning rate")
     parser.add_argument("--epochs", type=int, help="Override number of epochs")
-    parser.add_argument("--save_epochs", type=int, help="Override save frequency (epochs)")
+    parser.add_argument("--save_epochs", type=float, help="Override save frequency (epochs)")
     parser.add_argument("--ratio", type=float, help="Override text/TTS ratio")
     parser.add_argument("--wandb_project", type=str, help="Override wandb project")
     parser.add_argument("--wandb_run_name", type=str, help="Override wandb run name")
@@ -70,12 +84,17 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--log_level", type=str, default="INFO", help="Logging level")
     parser.add_argument("--resume", type=str, help="Resume from checkpoint")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
+    parser.add_argument("--no-liger", action="store_true", help="Disable Liger Kernel optimizations")
     
     args = parser.parse_args()
     
     # Setup logging and seed
     setup_logging(args.log_level)
     set_seed(args.seed)
+
+    # Register signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
     
     # Set memory optimization environment variables
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -129,6 +148,12 @@ def main():
     if args.wandb_run_name:
         config.wandb_run_name = args.wandb_run_name
     
+    if args.no_wandb:
+        config.use_wandb = False
+        
+    if args.no_liger:
+        config.use_liger_kernel = False
+        
     # Log configuration
     logger.info("Training Configuration:")
     if config.ratio == 0.0:
@@ -154,8 +179,9 @@ def main():
     logger.info(f"  FSDP: {config.fsdp}")
     logger.info(f"  Processes: {config.number_processes}")
     logger.info(f"  Save Steps: {config.save_steps}")
-    logger.info(f"  Wandb Project: {config.wandb_project}")
-    logger.info(f"  Wandb Run: {config.wandb_run_name}")
+    logger.info(f"  Wandb Project: {config.wandb_project if config.use_wandb else 'Disabled'}")
+    logger.info(f"  Wandb Run: {config.wandb_run_name if config.use_wandb else 'Disabled'}")
+    logger.info(f"  Liger Kernel: {'Enabled' if config.use_liger_kernel else 'Disabled'}")
     
     # Check if datasets exist
     if not os.path.exists(config.text_dataset) and not config.text_dataset.startswith('http'):
@@ -177,12 +203,14 @@ def main():
     # Start training
     logger.info("Initializing LLaDA TTS trainer...")
     try:
+        global trainer_instance
         trainer = LLaDATTSTrainer(config)
+        trainer_instance = trainer
         
         # Resume from checkpoint if specified
         if args.resume:
             logger.info(f"Resuming from checkpoint: {args.resume}")
-            # TODO: Add checkpoint loading logic
+            trainer.load_checkpoint(args.resume)
         
         logger.info("Starting TTS training...")
         trainer.train()

@@ -31,10 +31,12 @@ soundfile>=0.12.0
 phonemizer>=3.2.0
 unidecode>=1.3.0 
 flash-attn>=2.3.0
+snac>=1.0.0  # PyTorch SNAC audio codec
 
-# Inference dependencies
-onnxruntime>=1.16.0
-onnxruntime-gpu>=1.16.0  # For GPU acceleration
+# Performance optimization (optional but recommended)
+liger-kernel>=0.3.0  # Triton kernels for 20% speedup + 60% memory reduction
+
+# Inference dependencies (ONNX removed - using PyTorch SNAC instead)
 
 # API server dependencies
 fastapi>=0.104.0

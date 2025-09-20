@@ -6,15 +6,16 @@ Combines LLaDA text-to-speech model with SNAC audio codec for high-quality audio
 
 import torch
 import numpy as np
-import onnxruntime
 import logging
 import argparse
 import json
 import time
+import os
 from pathlib import Path
-from typing import Optional, Generator, List, Dict, Any, Union
+from typing import Optional, Generator, List, Dict, Any, Union, Tuple
 from dataclasses import dataclass
 from transformers import AutoTokenizer
+from snac import SNAC
 
 import sys
 from pathlib import Path
@@ -24,7 +25,7 @@ from llada_model import LLaDAForMaskedLM
 from sampling import create_sampler, SamplingConfig
 from tts_config import TTSConfig
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -32,7 +33,6 @@ class InferenceConfig:
     """Configuration for LLaDA+SNAC inference"""
     # Model paths
     llada_model_path: str
-    snac_model_path: str
     tokenizer_path: str
     
     # Generation parameters
@@ -44,17 +44,18 @@ class InferenceConfig:
     
     # Audio parameters
     sample_rate: int = 24000
-    min_audio_tokens: int = 28  # Minimum tokens needed for SNAC
-    audio_chunk_size: int = 28  # Process audio in chunks of N tokens
+    min_audio_tokens: int = 7   # Minimum tokens needed for SNAC (1 frame)
+    audio_chunk_size: int = 28  # Process audio in chunks of N tokens (4 frames)
     
     # Device settings
     device: str = "cuda"
     torch_dtype: str = "bfloat16"
     
     # Special tokens (TTS-specific)
-    audio_token_start: int = 128256  # Start of audio token range
-    audio_token_end: int = 156928    # End of audio token range (128256 + 7*4096)
-    mask_token_id: int = 126336
+    audio_token_start: int = 128256  # Start of custom token range (includes 10 special tokens + audio tokens)
+    audio_token_end: int = 156928    # End of audio token range (128256 + 10 + 7*4096)
+    mask_token_id: int = 126336      # Must match MASK_TOKEN_ID from tts_forward_process.py training
+    # Note: Custom token layout: positions 0-9 are special tokens, positions 10+ are audio tokens
     
     # Performance settings
     use_cache: bool = True
@@ -62,70 +63,87 @@ class InferenceConfig:
 
 
 class SNACAudioDecoder:
-    """SNAC audio decoder using ONNX runtime"""
+    """SNAC audio decoder using PyTorch SNAC model for high-quality audio generation"""
     
-    def __init__(self, snac_path: str):
-        self.snac_path = Path(snac_path)
-        if not self.snac_path.exists():
-            raise FileNotFoundError(f"SNAC model not found: {snac_path}")
+    def __init__(self):
+        # Initialize PyTorch SNAC model
+        logger.info("Loading PyTorch SNAC model...")
+        self.model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval()
         
-        logger.info(f"Loading SNAC model from {snac_path}")
-        self._snac_session = onnxruntime.InferenceSession(
-            str(snac_path),
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        )
+        # Set device
+        self.snac_device = os.environ.get("SNAC_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self.model.to(self.snac_device)
         
-        # Get input names for the ONNX model
-        self.input_names = [x.name for x in self._snac_session.get_inputs()]
-        logger.info(f"SNAC input names: {self.input_names}")
+        logger.info(f"SNAC model loaded on {self.snac_device}")
     
     def _convert_to_audio(self, multiframe: List[int]) -> Optional[np.ndarray]:
-        """Convert audio tokens to raw audio using SNAC decoder"""
-        if len(multiframe) < 28:  # Ensure we have enough tokens
-            logger.debug(f"Not enough tokens for audio conversion: {len(multiframe)} < 28")
+        """Convert audio tokens to raw audio using PyTorch SNAC decoder with proper hierarchical structure"""
+        if len(multiframe) < 7:  # Need at least 1 frame (7 tokens)
+            logger.debug(f"Not enough tokens for audio conversion: {len(multiframe)} < 7")
             return None
 
+        # Process in groups of 7 tokens per frame (SNAC structure)
         num_frames = len(multiframe) // 7
-        frame = multiframe[:num_frames * 7]
+        frame = multiframe[:num_frames * 7]  # Use complete frames only
 
-        # Initialize empty numpy arrays
-        codes_0 = np.array([], dtype=np.int32)
-        codes_1 = np.array([], dtype=np.int32) 
-        codes_2 = np.array([], dtype=np.int32)
+        # Initialize hierarchical code tensors (following original working code)
+        codes_0 = torch.tensor([], device=self.snac_device, dtype=torch.int32)
+        codes_1 = torch.tensor([], device=self.snac_device, dtype=torch.int32)
+        codes_2 = torch.tensor([], device=self.snac_device, dtype=torch.int32)
 
         for j in range(num_frames):
             i = 7 * j
-            # Append values to numpy arrays following SNAC's hierarchical structure
-            codes_0 = np.append(codes_0, frame[i])
-            codes_1 = np.append(codes_1, [frame[i + 1], frame[i + 4]])
-            codes_2 = np.append(codes_2, [frame[i + 2], frame[i + 3], frame[i + 5], frame[i + 6]])
+            
+            # Build codes_0 (1 token per frame)
+            if codes_0.shape[0] == 0:
+                codes_0 = torch.tensor([frame[i]], device=self.snac_device, dtype=torch.int32)
+            else:
+                codes_0 = torch.cat([codes_0, torch.tensor([frame[i]], device=self.snac_device, dtype=torch.int32)])
 
-        # Reshape arrays to match the expected input format (add batch dimension)
-        codes_0 = np.expand_dims(codes_0, axis=0)
-        codes_1 = np.expand_dims(codes_1, axis=0)
-        codes_2 = np.expand_dims(codes_2, axis=0)
+            # Build codes_1 (2 tokens per frame: positions i+1, i+4)
+            if codes_1.shape[0] == 0:
+                codes_1 = torch.tensor([frame[i+1]], device=self.snac_device, dtype=torch.int32)
+                codes_1 = torch.cat([codes_1, torch.tensor([frame[i+4]], device=self.snac_device, dtype=torch.int32)])
+            else:
+                codes_1 = torch.cat([codes_1, torch.tensor([frame[i+1]], device=self.snac_device, dtype=torch.int32)])
+                codes_1 = torch.cat([codes_1, torch.tensor([frame[i+4]], device=self.snac_device, dtype=torch.int32)])
+            
+            # Build codes_2 (4 tokens per frame: positions i+2, i+3, i+5, i+6)
+            if codes_2.shape[0] == 0:
+                codes_2 = torch.tensor([frame[i+2]], device=self.snac_device, dtype=torch.int32)
+                codes_2 = torch.cat([codes_2, torch.tensor([frame[i+3]], device=self.snac_device, dtype=torch.int32)])
+                codes_2 = torch.cat([codes_2, torch.tensor([frame[i+5]], device=self.snac_device, dtype=torch.int32)])
+                codes_2 = torch.cat([codes_2, torch.tensor([frame[i+6]], device=self.snac_device, dtype=torch.int32)])
+            else:
+                codes_2 = torch.cat([codes_2, torch.tensor([frame[i+2]], device=self.snac_device, dtype=torch.int32)])
+                codes_2 = torch.cat([codes_2, torch.tensor([frame[i+3]], device=self.snac_device, dtype=torch.int32)])
+                codes_2 = torch.cat([codes_2, torch.tensor([frame[i+5]], device=self.snac_device, dtype=torch.int32)])
+                codes_2 = torch.cat([codes_2, torch.tensor([frame[i+6]], device=self.snac_device, dtype=torch.int32)])
 
-        # Validate token ranges (SNAC codebook typically 0-4096)
-        if (np.any(codes_0 < 0) or np.any(codes_0 > 4096) or
-            np.any(codes_1 < 0) or np.any(codes_1 > 4096) or
-            np.any(codes_2 < 0) or np.any(codes_2 > 4096)):
-            logger.warning(f"Audio tokens out of range: codes_0 range [{codes_0.min()}, {codes_0.max()}], "
-                         f"codes_1 range [{codes_1.min()}, {codes_1.max()}], "
-                         f"codes_2 range [{codes_2.min()}, {codes_2.max()}]")
+        # Prepare codes list with batch dimension
+        codes = [codes_0.unsqueeze(0), codes_1.unsqueeze(0), codes_2.unsqueeze(0)]
+        
+        # Validate token ranges (SNAC codebook expects 0-4096)
+        if (torch.any(codes[0] < 0) or torch.any(codes[0] > 4096) or 
+            torch.any(codes[1] < 0) or torch.any(codes[1] > 4096) or 
+            torch.any(codes[2] < 0) or torch.any(codes[2] > 4096)):
+            logger.warning(f"Audio tokens out of range: codes_0 range [{codes[0].min()}, {codes[0].max()}], "
+                         f"codes_1 range [{codes[1].min()}, {codes[1].max()}], "
+                         f"codes_2 range [{codes[2].min()}, {codes[2].max()}]")
             return None
 
         try:
-            # Create input dictionary for ONNX session
-            input_dict = dict(zip(self.input_names, [codes_0, codes_1, codes_2]))
+            # Generate audio using PyTorch SNAC model
+            with torch.inference_mode():
+                audio_hat = self.model.decode(codes)
             
-            # Run SNAC inference
-            audio_hat = self._snac_session.run(None, input_dict)[0]
-            
-            # Process output - extract relevant audio segment
-            audio_np = audio_hat[:, :, 2048:4096]  # Extract middle portion
+            # Extract audio slice (following original working code)
+            audio_slice = audio_hat[:, :, 2048:4096]
+            detached_audio = audio_slice.detach().cpu()
+            audio_np = detached_audio.numpy()
             
             # Convert to int16 format for audio output
-            audio_int16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
+            audio_int16 = (audio_np * 32767).astype(np.int16)
             
             return audio_int16.flatten()
             
@@ -168,51 +186,84 @@ class LLaDAInference:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
         logger.info(f"Tokenizer loaded. Vocab size: {len(self.tokenizer)}")
+        
+        logger.info(f"✅ Using mask token ID: {self.config.mask_token_id} (added directly as token IDs)")
+        
+        # Debug: Check for custom tokens in vocabulary
+        vocab = self.tokenizer.get_vocab()
+        custom_tokens = [k for k in vocab.keys() if k.startswith("<custom_token_")]
+        logger.info(f"Found {len(custom_tokens)} custom tokens in vocabulary")
+        if custom_tokens:
+            logger.info(f"Sample custom tokens: {custom_tokens[:5]} ...")
+            logger.info(f"Custom token ID range: {min(vocab[t] for t in custom_tokens)} - {max(vocab[t] for t in custom_tokens)}")
+        else:
+            logger.warning("❌ NO custom tokens found in tokenizer vocabulary!")
     
     def _load_model(self):
-        """Load the LLaDA model"""
+        """Load the LLaDA model - exactly like training does it"""
         logger.info(f"Loading LLaDA model from {self.config.llada_model_path}")
         
-        try:
-            # Load model checkpoint
-            self.model = LLaDAForMaskedLM.from_pretrained(
-                self.config.llada_model_path,
-                torch_dtype=self.torch_dtype,
-                device_map=self.config.device,
-                trust_remote_code=True
-            )
-        except Exception as e:
-            logger.warning(f"Failed to load with from_pretrained: {e}")
-            # Fallback: load state dict
-            from transformers import LlamaConfig
-            
-            # Try to load config
-            config_path = Path(self.config.llada_model_path) / "config.json"
-            if config_path.exists():
-                with open(config_path) as f:
-                    model_config = json.load(f)
-                llama_config = LlamaConfig(**model_config)
-            else:
-                raise FileNotFoundError(f"Model config not found: {config_path}")
-            
-            # Initialize model and load weights
-            self.model = LLaDAForMaskedLM(llama_config)
-            
-            # Load state dict
-            state_dict_path = Path(self.config.llada_model_path) / "pytorch_model.bin"
-            if not state_dict_path.exists():
-                state_dict_path = Path(self.config.llada_model_path) / "model.safetensors"
-            
-            if state_dict_path.exists():
-                state_dict = torch.load(state_dict_path, map_location=self.device)
-                self.model.load_state_dict(state_dict, strict=False)
-            else:
-                raise FileNotFoundError(f"Model weights not found in {self.config.llada_model_path}")
+        from transformers import LlamaConfig, AutoModelForCausalLM
+        
+        # Load the training config that was saved with the checkpoint
+        config_path = Path(self.config.llada_model_path) / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Model config not found: {config_path}")
+        
+        with open(config_path) as f:
+            training_config = json.load(f)
+        
+        # Get the original base model name
+        base_model_name = training_config.get('model_name_or_path', 'canopylabs/3b-hi-pretrain-research_release')
+        logger.info(f"Loading base model architecture from: {base_model_name}")
+        
+        # Load base model to get architecture (exactly like training code does)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            torch_dtype=torch.float32,
+            device_map="cpu",
+            trust_remote_code=True
+        )
+        
+        # Get and convert config (exactly like training code does)
+        model_config = hf_model.config
+        llama_config = LlamaConfig(
+            vocab_size=len(self.tokenizer),  # Use current tokenizer size
+            hidden_size=getattr(model_config, 'hidden_size', 4096),
+            intermediate_size=getattr(model_config, 'intermediate_size', 11008),
+            num_hidden_layers=getattr(model_config, 'num_hidden_layers', 32),
+            num_attention_heads=getattr(model_config, 'num_attention_heads', 32),
+            num_key_value_heads=getattr(model_config, 'num_key_value_heads', 32),
+            max_position_embeddings=getattr(model_config, 'max_position_embeddings', 4096),
+            rms_norm_eps=getattr(model_config, 'rms_norm_eps', 1e-6),
+            rope_theta=getattr(model_config, 'rope_theta', 10000.0),
+            attention_bias=getattr(model_config, 'attention_bias', False),
+            tie_word_embeddings=getattr(model_config, 'tie_word_embeddings', False),
+        )
+        
+        logger.info(f"Model architecture: hidden_size={llama_config.hidden_size}, num_layers={llama_config.num_hidden_layers}")
+        
+        # Create LLaDA model with correct architecture
+        self.model = LLaDAForMaskedLM(llama_config)
+        
+        # Clean up base model
+        del hf_model
+        
+        # Load the saved TTS model weights
+        state_dict_path = Path(self.config.llada_model_path) / "pytorch_model.bin"
+        if not state_dict_path.exists():
+            raise FileNotFoundError(f"Model weights not found: {state_dict_path}")
+        
+        logger.info(f"Loading TTS weights from {state_dict_path}")
+        state_dict = torch.load(state_dict_path, map_location='cpu')
+        self.model.load_state_dict(state_dict, strict=False)
         
         self.model.to(self.device).to(self.torch_dtype)
         self.model.eval()
         
-        logger.info(f"✅ Model loaded. Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        logger.info(f"✅ Model loaded successfully!")
+        logger.info(f"✅ Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        logger.info(f"✅ Vocab size: {self.model.config.vocab_size}")
     
     def _setup_sampler(self):
         """Setup the LLaDA sampler"""
@@ -233,25 +284,30 @@ class LLaDAInference:
     
     def _load_snac(self):
         """Load SNAC audio decoder"""
-        self.snac_decoder = SNACAudioDecoder(self.config.snac_model_path)
+        self.snac_decoder = SNACAudioDecoder()
         logger.info("✅ SNAC decoder loaded")
     
-    def _token_to_audio_id(self, token: int) -> Optional[int]:
-        """Convert model token ID to SNAC audio token ID"""
-        if self.config.audio_token_start <= token <= self.config.audio_token_end:
-            # Map to 0-4096 range for SNAC
-            return token - self.config.audio_token_start
-        return None
-    
     def _extract_audio_tokens(self, token_ids: torch.Tensor) -> List[int]:
-        """Extract and convert audio tokens from generated sequence"""
+        """Extract and convert audio tokens from generated sequence (for non-iterative generation)"""
         audio_tokens = []
+        audio_token_position = 0
         
         for token in token_ids.flatten():
             token_id = token.item()
-            audio_id = self._token_to_audio_id(token_id)
-            if audio_id is not None:
-                audio_tokens.append(audio_id)
+            
+            # Check if it's an audio token
+            if self.config.audio_token_start <= token_id <= self.config.audio_token_end:
+                # Convert using formula from working code: account for 10 special tokens before audio tokens
+                snac_token_id = (token_id - self.config.audio_token_start) - 10 - ((audio_token_position % 7) * 4096)
+                
+                # Ensure token is in valid SNAC range (0-4096)
+                if 0 <= snac_token_id <= 4096:
+                    audio_tokens.append(snac_token_id)
+                else:
+                    logger.debug(f"Token {token_id} converted to {snac_token_id} is out of SNAC range, skipping")
+                
+                # Increment position for every audio token
+                audio_token_position += 1
         
         return audio_tokens
     
@@ -342,12 +398,265 @@ class LLaDAInference:
         except Exception as e:
             logger.error(f"Failed to save audio: {e}")
 
+    def _create_tts_prompt_with_masks(self, text: str, num_mask_tokens: int = 28) -> str:
+        """
+        Create TTS prompt with specified number of mask tokens
+        
+        Args:
+            text: Input text (should contain conversation format)
+            num_mask_tokens: Number of mask tokens to add after START_OF_SPEECH
+        
+        Returns:
+            Formatted prompt with mask tokens
+        """
+        # Convert token IDs to actual token names in vocabulary
+        # Token ID 128256 + X -> <custom_token_X>
+        def id_to_token_name(token_id: int) -> str:
+            return f"<custom_token_{token_id - 128256}>"
+        
+        start_of_human = id_to_token_name(128259)    # <custom_token_3>
+        end_of_human = id_to_token_name(128260)      # <custom_token_4>
+        start_of_ai = id_to_token_name(128261)       # <custom_token_5>
+        start_of_speech = id_to_token_name(128257)   # <custom_token_1>
+        end_of_speech = id_to_token_name(128258)     # <custom_token_2>
+        end_of_ai = id_to_token_name(128262)         # <custom_token_6>
+        
+        # Note: We no longer need the mask token string since we add mask tokens as direct IDs
+        
+        # Create the base prompt without mask tokens (we'll add them as token IDs later)
+        if start_of_speech in text:
+            # Return text without additional mask tokens (they'll be added later)
+            return text
+        else:
+            # Create complete conversation format without mask tokens
+            return f"{start_of_human}{text}{end_of_human}{start_of_ai}{start_of_speech}"
+    
+    def _extract_generated_audio_tokens(self, original_ids: torch.Tensor, generated_ids: torch.Tensor) -> Tuple[List[int], List[int]]:
+        """Extract newly generated tokens and return both SNAC tokens and original model tokens"""
+        # Get the new tokens (everything after the original prompt)
+        new_tokens = generated_ids[:, original_ids.size(1):]
+        
+        audio_tokens = []  # SNAC tokens (0-4095) 
+        model_tokens = []  # Original model tokens (for next iteration)
+        
+        # Track position in audio token sequence (not just successful conversions)
+        audio_token_position = 0
+        
+        for token in new_tokens.flatten():
+            token_id = token.item()
+            
+            # Check for END_OF_SPEECH or END_OF_AI tokens
+            if token_id in [128258, 128262]:  # END_OF_SPEECH, END_OF_AI
+                logger.info(f"Found end token: {token_id}, stopping generation")
+                break
+                
+            # Check if it's an audio token
+            if self.config.audio_token_start <= token_id <= self.config.audio_token_end:
+                # Convert using formula from working code: account for 10 special tokens before audio tokens
+                # token_id - audio_token_start gives position in custom token range
+                # Subtract 10 to get position in audio token range, then apply hierarchical offset
+                snac_token_id = (token_id - self.config.audio_token_start) - 10 - ((audio_token_position % 7) * 4096)
+                
+                logger.debug(f"Audio token {audio_token_position}: {token_id} → {snac_token_id} (pos % 7 = {audio_token_position % 7})")
+                
+                # Ensure token is in valid SNAC range (0-4096)
+                if 0 <= snac_token_id <= 4096:
+                    audio_tokens.append(snac_token_id)
+                    model_tokens.append(token_id)  # Keep original for next iteration
+                    logger.debug(f"✅ Accepted SNAC token: {snac_token_id}")
+                else:
+                    logger.debug(f"❌ Token {token_id} converted to {snac_token_id} is out of SNAC range, skipping")
+                
+                # Increment position for every audio token (whether accepted or not)
+                audio_token_position += 1
+        
+        logger.debug(f"Final result: {len(audio_tokens)} valid SNAC tokens from {audio_token_position} audio tokens")
+        return audio_tokens, model_tokens
+    
+    def generate_text_to_speech_iterative(
+        self,
+        text: str,
+        max_chunks: int = 50,
+        chunk_size: int = 28,
+        stream_audio: bool = False
+    ) -> Union[np.ndarray, Generator[np.ndarray, None, None]]:
+        """
+        Generate speech using iterative chunk-based approach
+        
+        Args:
+            text: Input text for TTS
+            max_chunks: Maximum number of 28-token chunks to generate
+            chunk_size: Number of mask tokens per chunk (28 for SNAC frames)
+            stream_audio: If True, yield audio chunks as they're generated
+            
+        Returns:
+            Audio array or generator of audio chunks
+        """
+        if stream_audio:
+            return self._generate_iterative_streaming(text, max_chunks, chunk_size)
+        else:
+            return self._generate_iterative_batch(text, max_chunks, chunk_size)
+    
+    def _generate_iterative_batch(self, text: str, max_chunks: int, chunk_size: int) -> np.ndarray:
+        """Non-streaming iterative generation that returns complete audio"""
+        logger.info(f"Starting iterative TTS generation: {max_chunks} chunks of {chunk_size} tokens")
+        logger.info(f"Input text: '{text[:50]}{'...' if len(text) > 50 else ''}'")
+        
+        all_audio_tokens = []
+        current_sequence = text
+        
+        for chunk_idx in range(max_chunks):
+            logger.info(f"Generating chunk {chunk_idx + 1}/{max_chunks}")
+            
+            # Create base prompt without mask tokens
+            base_prompt = self._create_tts_prompt_with_masks(current_sequence, 0)  # 0 mask tokens for now
+            logger.info(f"Chunk {chunk_idx + 1} base prompt: {base_prompt[:200]}...")
+            
+            # Tokenize the base prompt
+            inputs = self.tokenizer(base_prompt, return_tensors="pt", padding=True, truncation=True)
+            base_input_ids = inputs.input_ids.to(self.device)
+            
+            # Add mask tokens directly as token IDs
+            mask_token_ids = torch.full((base_input_ids.shape[0], chunk_size), 
+                                       self.config.mask_token_id, 
+                                       dtype=base_input_ids.dtype, 
+                                       device=self.device)
+            
+            # Concatenate base prompt + mask tokens
+            input_ids = torch.cat([base_input_ids, mask_token_ids], dim=1)
+            logger.info(f"Input IDs shape: {input_ids.shape}, prompt length: {input_ids.size(1)}")
+            
+            # Debug: Show token structure
+            first_tokens = input_ids[0][:15].cpu().numpy().tolist()
+            logger.info(f"First 15 token IDs: {first_tokens}")
+            
+            # Count mask tokens
+            mask_count = (input_ids == self.config.mask_token_id).sum().item()
+            logger.info(f"✅ Found {mask_count} mask tokens (ID: {self.config.mask_token_id})")
+            
+            # Check if we see the expected special tokens
+            expected_tokens = [128259, 128260, 128261, 128257]
+            found_expected = [tid for tid in input_ids[0].cpu().numpy() if tid in expected_tokens]
+            logger.info(f"Found conversation tokens: {list(set(found_expected))}")
+            
+            # Generate tokens for this chunk
+            with torch.no_grad():
+                generated_ids = self.sampler.sample(
+                    prompt_ids=input_ids,
+                    max_new_tokens=chunk_size  # Only generate exactly chunk_size tokens
+                )
+            
+            logger.info(f"Generated IDs shape: {generated_ids.shape}")
+            
+            # Debug: Check what tokens were actually generated
+            new_tokens = generated_ids[:, input_ids.size(1):]
+            new_tokens_list = new_tokens.flatten().cpu().numpy().tolist()
+            logger.info(f"Generated tokens: {new_tokens_list[:10]}...")  # First 10 tokens
+            
+            # Check if any are in audio range
+            audio_range_tokens = [t for t in new_tokens_list if self.config.audio_token_start <= t <= self.config.audio_token_end]
+            logger.info(f"Audio range tokens found: {len(audio_range_tokens)} out of {len(new_tokens_list)}")
+            if audio_range_tokens:
+                logger.info(f"First 5 audio tokens: {audio_range_tokens[:5]}")
+            
+            # Extract only the new audio tokens from this generation
+            chunk_audio_tokens, chunk_model_tokens = self._extract_generated_audio_tokens(input_ids, generated_ids)
+            
+            logger.info(f"Extracted {len(chunk_audio_tokens)} SNAC tokens, {len(chunk_model_tokens)} model tokens")
+            if chunk_audio_tokens:
+                logger.info(f"First 5 SNAC tokens: {chunk_audio_tokens[:5]}")
+                logger.info(f"First 5 model tokens: {chunk_model_tokens[:5]}")
+            
+            if not chunk_audio_tokens:
+                logger.info(f"No audio tokens generated in chunk {chunk_idx + 1}, stopping")
+                break
+            
+            logger.info(f"Chunk {chunk_idx + 1}: Generated {len(chunk_audio_tokens)} audio tokens")
+            all_audio_tokens.extend(chunk_audio_tokens)
+            
+            # Update current sequence with generated tokens (for next iteration)
+            # Use the original model tokens directly
+            generated_model_token_strings = []
+            for model_token in chunk_model_tokens:
+                generated_model_token_strings.append(f"<custom_token_{model_token}>")
+            
+            # Append to current sequence for next iteration
+            current_sequence += "".join(generated_model_token_strings)
+        
+        logger.info(f"Iterative generation complete. Total audio tokens: {len(all_audio_tokens)}")
+        
+        if not all_audio_tokens:
+            logger.warning("No audio tokens generated")
+            return np.array([], dtype=np.int16)
+        
+        # Generate complete audio as numpy array
+        return self._batch_audio_generation(all_audio_tokens)
+    
+    def _generate_iterative_streaming(self, text: str, max_chunks: int, chunk_size: int) -> Generator[np.ndarray, None, None]:
+        """Streaming iterative generation that yields audio chunks"""
+        logger.info(f"Starting iterative TTS generation: {max_chunks} chunks of {chunk_size} tokens")
+        logger.info(f"Input text: '{text[:50]}{'...' if len(text) > 50 else ''}'")
+        
+        all_audio_tokens = []
+        current_sequence = text
+        
+        for chunk_idx in range(max_chunks):
+            logger.info(f"Generating chunk {chunk_idx + 1}/{max_chunks}")
+            
+            # Create prompt with mask tokens for this chunk
+            prompt_with_masks = self._create_tts_prompt_with_masks(current_sequence, chunk_size)
+            
+            # Tokenize the prompt
+            inputs = self.tokenizer(prompt_with_masks, return_tensors="pt", padding=True, truncation=True)
+            input_ids = inputs.input_ids.to(self.device)
+            
+            # Generate tokens for this chunk
+            with torch.no_grad():
+                generated_ids = self.sampler.sample(
+                    prompt_ids=input_ids,
+                    max_new_tokens=chunk_size  # Only generate exactly chunk_size tokens
+                )
+            # Extract only the new audio tokens from this generation
+            chunk_audio_tokens, chunk_model_tokens = self._extract_generated_audio_tokens(input_ids, generated_ids)
+            
+            if not chunk_audio_tokens:
+                logger.info(f"No audio tokens generated in chunk {chunk_idx + 1}, stopping")
+                break
+            
+            logger.info(f"Chunk {chunk_idx + 1}: Generated {len(chunk_audio_tokens)} audio tokens")
+            all_audio_tokens.extend(chunk_audio_tokens)
+            
+            # Update current sequence with generated tokens (for next iteration)
+            # Use the original model tokens directly
+            generated_model_token_strings = []
+            for model_token in chunk_model_tokens:
+                generated_model_token_strings.append(f"<custom_token_{model_token}>")
+            
+            # Append to current sequence for next iteration
+            current_sequence += "".join(generated_model_token_strings)
+            
+            # Check if we have enough tokens for SNAC (minimum 7)
+            if len(all_audio_tokens) >= 7:
+                # Generate audio for accumulated tokens
+                if len(all_audio_tokens) >= chunk_size:
+                    chunk_for_audio = all_audio_tokens[-chunk_size:]
+                    audio_chunk = self.snac_decoder._convert_to_audio(chunk_for_audio)
+                    if audio_chunk is not None:
+                        yield audio_chunk
+        
+        # Generate final audio chunk if there are remaining tokens
+        if len(all_audio_tokens) % chunk_size != 0:
+            remaining_tokens = all_audio_tokens[-(len(all_audio_tokens) % chunk_size):]
+            if len(remaining_tokens) >= self.config.min_audio_tokens:
+                audio_chunk = self.snac_decoder._convert_to_audio(remaining_tokens)
+                if audio_chunk is not None:
+                    yield audio_chunk
+
 
 def create_inference_config_from_args(args) -> InferenceConfig:
     """Create inference config from command line arguments"""
     return InferenceConfig(
         llada_model_path=args.model_path,
-        snac_model_path=args.snac_path,
         tokenizer_path=args.tokenizer_path or args.model_path,
         max_new_tokens=args.max_tokens,
         sampling_method=args.sampling_method,
@@ -365,13 +674,15 @@ def main():
     
     # Model paths
     parser.add_argument("--model-path", required=True, help="Path to LLaDA model")
-    parser.add_argument("--snac-path", required=True, help="Path to SNAC ONNX model")
+
     parser.add_argument("--tokenizer-path", help="Path to tokenizer (default: same as model)")
     
     # Generation parameters
     parser.add_argument("--text", required=True, help="Text to convert to speech")
     parser.add_argument("--output", default="output.wav", help="Output audio file")
     parser.add_argument("--max-tokens", type=int, default=1024, help="Maximum tokens to generate")
+    parser.add_argument("--iterative", action="store_true", help="Use iterative chunk-based generation (recommended)")
+    parser.add_argument("--max-chunks", type=int, default=50, help="Maximum number of chunks for iterative generation")
     parser.add_argument("--sampling-method", default="fixed_length", 
                        choices=["fixed_length", "semi_autoregressive_padding"],
                        help="Sampling method")
@@ -397,6 +708,8 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # Debug logging can be enabled with --verbose flag
+    
     # Create inference config
     config = create_inference_config_from_args(args)
     
@@ -404,25 +717,58 @@ def main():
     inference_engine = LLaDAInference(config)
     
     # Generate speech
-    if args.stream:
-        logger.info("🎵 Streaming mode enabled")
-        audio_chunks = []
-        for chunk in inference_engine.generate_text_to_speech(args.text, stream_audio=True):
-            audio_chunks.append(chunk)
-        
-        if audio_chunks:
-            # Concatenate all chunks
-            full_audio = np.concatenate(audio_chunks)
-            inference_engine.save_audio(full_audio, args.output)
+    if args.iterative:
+        logger.info("🎵 Using iterative chunk-based generation")
+        if args.stream:
+            logger.info("🎵 Streaming mode enabled")
+            audio_chunks = []
+            for chunk in inference_engine.generate_text_to_speech_iterative(
+                args.text,
+                max_chunks=args.max_chunks,
+                chunk_size=28, # SNAC chunk size
+                stream_audio=True
+            ):
+                audio_chunks.append(chunk)
+            
+            if audio_chunks:
+                # Concatenate all chunks
+                full_audio = np.concatenate(audio_chunks)
+                inference_engine.save_audio(full_audio, args.output)
+            else:
+                logger.error("No audio chunks generated")
         else:
-            logger.error("No audio chunks generated")
+            logger.info("🎵 Batch iterative mode")
+            audio_samples = inference_engine.generate_text_to_speech_iterative(
+                args.text,
+                max_chunks=args.max_chunks,
+                chunk_size=28,
+                stream_audio=False
+            )
+            if len(audio_samples) > 0:
+                inference_engine.save_audio(audio_samples, args.output)
+            else:
+                logger.error("No audio generated")
     else:
-        logger.info("🎵 Batch mode")
-        audio_samples = inference_engine.generate_text_to_speech(args.text, stream_audio=False)
-        if len(audio_samples) > 0:
-            inference_engine.save_audio(audio_samples, args.output)
+        # Original generation method
+        if args.stream:
+            logger.info("🎵 Streaming mode enabled")
+            audio_chunks = []
+            for chunk in inference_engine.generate_text_to_speech(args.text, stream_audio=True):
+                audio_chunks.append(chunk)
+            
+            if audio_chunks:
+                # Concatenate all chunks
+                full_audio = np.concatenate(audio_chunks)
+                inference_engine.save_audio(full_audio, args.output)
+            else:
+                logger.error("No audio chunks generated")
         else:
-            logger.error("No audio generated")
+            logger.info("🎵 Batch mode")
+            audio_samples = inference_engine.generate_text_to_speech(args.text, stream_audio=False)
+            if len(audio_samples) > 0:
+                inference_engine.save_audio(audio_samples, args.output)
+            else:
+                logger.error("No audio generated")
 
 
 if __name__ == "__main__":

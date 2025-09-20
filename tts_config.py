@@ -29,8 +29,8 @@ class TTSConfig:
     epochs: int = 3
     warmup_epochs: float = 0.1  # Warmup for first 10% of training
     weight_decay: float = 0.1
-    max_grad_norm: float = 1.0
-    save_epochs: int = 1  # Save checkpoint every N epochs
+    max_grad_norm: Optional[float] = 1.0  # Max gradient norm for clipping. Set to 0 or a negative value to disable.
+    save_epochs: float = 1.0  # Save checkpoint every N epochs
     
     # TTS-specific parameters
     max_length: int = 4096
@@ -41,28 +41,41 @@ class TTSConfig:
     training_mode: str = "sft"  # Training mode: "pretraining" or "sft"
     use_weighted_loss: bool = False  # Whether to weight loss by 1/p_mask (can cause instability)
     use_linear_masking_schedule: bool = False  # Use linear masking schedule (1% → 100%) instead of random
-    use_curriculum_learning: bool = True  # Use curriculum learning timestep schedule (CLTS) from diffusion optimization
+    use_curriculum_learning: bool = False  # Use curriculum learning timestep schedule (CLTS) from diffusion optimization
     curriculum_target_progress: float = 0.7  # When to fully transition to curriculum learning (0.0-1.0)
     
     # Momentum decay optimization for diffusion models
-    use_momentum_decay: bool = True  # Use momentum decay with learning rate compensation (MDLRC)
+    use_momentum_decay: bool = False  # Use momentum decay with learning rate compensation (MDLRC)
     initial_momentum: float = 0.9  # Initial momentum value (β₀)
     final_momentum: float = 0.5    # Final momentum value
+    
+    # SNAC hierarchical structure constraints
+    use_position_aware_loss: bool = False  # Enable position-aware loss for SNAC hierarchical constraints
     
     # Logging and saving
     logging_steps: int = 100
     save_steps: int = 2000
     save_total_limit: int = 3
     prediction_logging_steps: int = 50  # Log detailed predictions every N steps
+    num_workers: int = 4 # Number of workers for DataLoader
     
     # Mixed precision and distributed training
     fp16: bool = True
     fsdp: bool = True
     number_processes: int = 1
     
+    # Performance optimizations
+    use_liger_kernel: bool = True  # Use Liger Kernel for 20% speedup + 60% memory reduction
+    gradient_checkpointing: bool = True  # Enable gradient checkpointing for memory savings
+    
+    # BitsAndBytes quantization
+    use_bnb_quantization: bool = False  # Use BitsAndBytes quantization for memory savings
+    bnb_4bit: bool = True  # Use 4-bit quantization (if False, uses 8-bit)
+    
     # Wandb
     wandb_project: str = "llada_tts"
     wandb_run_name: Optional[str] = None
+    use_wandb: bool = True
     
     # Special tokens
     bos_token_id: int = 1
@@ -92,11 +105,19 @@ class TTSConfig:
             'pad_token_id': config_dict.get('pad_token', 0),
             'training_mode': config_dict.get('training_mode', 'sft'),
             'epochs': config_dict.get('epochs', 1),
-            'save_epochs': config_dict.get('save_epochs', 1),  # Save every N epochs
+            'save_epochs': config_dict.get('save_epochs', 1.0),  # Save every N epochs
             'prediction_logging_steps': config_dict.get('prediction_logging_steps', 50),
             'use_weighted_loss': config_dict.get('use_weighted_loss', True),
             'warmup_epochs': config_dict.get('warmup_epochs', 0.1),
             'lr_scheduler_type': config_dict.get('lr_scheduler_type', 'cosine'),
+            'use_position_aware_loss': config_dict.get('use_position_aware_loss', False),
+            'use_wandb': config_dict.get('use_wandb', True),
+            'use_liger_kernel': config_dict.get('use_liger_kernel', True),
+            'num_workers': config_dict.get('num_workers', 4),
+            'gradient_checkpointing': config_dict.get('gradient_checkpointing', True),
+            'use_bnb_quantization': config_dict.get('use_bnb_quantization', False),
+            'bnb_4bit': config_dict.get('bnb_4bit', True),
+            'fp16': config_dict.get('fp16', True),
         }
         
         # If no tokenizer specified, use model name
@@ -205,12 +226,15 @@ def create_sample_tts_config():
         'number_processes': 1,
         'learning_rate': 5e-4,
         'ratio': 0.5,
+        'use_wandb': True,
+        'use_liger_kernel': True,
         # TTS-specific settings
         'num_audio_tokens': 7 * 4096,
         'num_special_tokens': 10,
         'max_length': 4096,
         'mask_token_id': 126336,
         'eps': 1e-3,
+        'use_position_aware_loss': False,
     }
     
     with open('tts_config.yaml', 'w') as f:

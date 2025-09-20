@@ -4,6 +4,10 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullStateDictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.fsdp.api import ShardingStrategy, MixedPrecision
+from torch.nn.parallel import DistributedDataParallel as DDP
+import functools
 import torch.distributed as dist
 import os
 import json
@@ -19,8 +23,40 @@ from pretraining import forward_process
 from tts_config import TTSConfig
 from tts_dataset import create_tts_datasets, tts_data_collator, AlternatingDistributedSampler
 from transformers import LlamaConfig, LlamaForCausalLM, AutoModelForCausalLM
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.optim.lr_scheduler import LambdaLR
+
+# SNAC Hierarchical Structure Constants
+SNAC_AUDIO_TOKEN_START = 128266  # 128256 + 10 (base + special tokens)
+SNAC_CODEBOOK_SIZE = 4096
+
+def get_valid_snac_token_range(position_mod_7: int) -> tuple:
+    """
+    Get valid token ID range for dataset's linear position mapping
+    
+    The dataset uses linear position-based mapping where each position (0-6)
+    gets its own 4096-token range, rather than the hierarchical SNAC structure.
+    This matches how the dataset was preprocessed.
+    
+    Args:
+        position_mod_7: Position within 7-token frame (0-6)
+        
+    Returns:
+        tuple: (start_token_id, end_token_id) for valid range
+    """
+    base = SNAC_AUDIO_TOKEN_START
+    
+    # Linear position mapping: each position gets its own 4096-token range
+    start_token = base + position_mod_7 * SNAC_CODEBOOK_SIZE
+    end_token = start_token + SNAC_CODEBOOK_SIZE
+    
+    return (start_token, end_token)
+
+def validate_snac_token(token_id: int, position_mod_7: int) -> bool:
+    """Check if token_id is valid for the given SNAC position"""
+    valid_range = get_valid_snac_token_range(position_mod_7)
+    return valid_range[0] <= token_id < valid_range[1]
 
 class LLaDATTSTrainer:
     """LLaDA trainer specifically for TTS with mixed text and audio data"""
@@ -28,6 +64,26 @@ class LLaDATTSTrainer:
     def __init__(self, config: TTSConfig):
         self.config = config
         self.use_data_parallel = False  # Initialize before setup_distributed
+        self.use_wandb = config.use_wandb  # Store wandb status
+        
+        # Apply Liger Kernel optimizations FIRST, before any model operations
+        if self.config.use_liger_kernel:
+            try:
+                from liger_kernel.transformers import apply_liger_kernel_to_llama
+                apply_liger_kernel_to_llama(
+                    rope=True,
+                    rms_norm=True,
+                    swiglu=True,
+                    cross_entropy=False,  # Disable regular cross_entropy when using fused version
+                    fused_linear_cross_entropy=True  # Use fused version for better performance
+                )
+                print("🚀 Applied Liger Kernel optimizations (20% speedup + 60% memory reduction)")
+            except ImportError:
+                print("⚠️  Liger Kernel not installed. Install with: pip install liger-kernel")
+                print("   Missing out on 20% speedup + 60% memory reduction")
+            except Exception as e:
+                print(f"⚠️  Failed to apply Liger Kernel optimizations: {e}")
+        
         self.setup_logging()
         self.setup_distributed()
         self.setup_tokenizer()
@@ -38,12 +94,14 @@ class LLaDATTSTrainer:
         # Tracking for different data types
         self.text_step = 0
         self.audio_step = 0
+        self.global_step = 0
+        self.start_epoch = 0
         
         # HuggingFace Hub API
         self.api = HfApi()
         
         # Initialize wandb if configured
-        if config.wandb_project and self.is_main_process():
+        if self.use_wandb and config.wandb_project and self.is_main_process():
             wandb.init(
                 project=config.wandb_project,
                 name=config.wandb_run_name,
@@ -122,14 +180,52 @@ class LLaDATTSTrainer:
     def setup_model(self):
         """Setup LLaDA model with resized embeddings"""
         self.logger.info("Setting up LLaDA model")
+        
+        # Configure BitsAndBytes if enabled
+        bnb_config = None
+        if self.config.use_bnb_quantization:
+            try:
+                from transformers import BitsAndBytesConfig
                 
+                if self.config.bnb_4bit:
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                        bnb_4bit_use_double_quant=True,
+                    )
+                    self.logger.info("🔧 Using 4-bit BitsAndBytes quantization")
+                else:
+                    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+                    self.logger.info("🔧 Using 8-bit BitsAndBytes quantization")
+                    
+            except ImportError:
+                self.logger.warning("⚠️ BitsAndBytes not installed. Install with: pip install bitsandbytes")
+                self.logger.warning("   Continuing without quantization...")
+                bnb_config = None
+        
         # Try loading as AutoModel first, then LlamaForCausalLM
         self.logger.info("Attempting to load with AutoModelForCausalLM...")
+        
+        # For distributed training, we need to be more careful with device mapping
+        if bnb_config and self.world_size > 1:
+            # In distributed setup, load on current device only
+            device_map = {"": self.local_rank}
+            self.logger.info(f"Loading quantized model on device {self.local_rank} for distributed training")
+        elif bnb_config:
+            # Single GPU setup can use auto device mapping
+            device_map = "auto"
+            self.logger.info("Loading quantized model with auto device mapping")
+        else:
+            # No quantization, load on CPU first
+            device_map = "cpu"
+        
         hf_model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name_or_path,
-            torch_dtype=torch.float32,  # Use float32 to avoid conversion issues
-            device_map="cpu",  # Load on CPU first
-            trust_remote_code=True
+            torch_dtype=torch.float32 if not bnb_config else torch.bfloat16,
+            device_map=device_map,
+            trust_remote_code=True,
+            quantization_config=bnb_config
         )
         self.logger.info("Successfully loaded with AutoModelForCausalLM")
         
@@ -138,41 +234,21 @@ class LLaDATTSTrainer:
         self.logger.info(f"Loaded model config: {type(model_config)}")
         self.logger.info(f"Model architecture: {model_config.architectures if hasattr(model_config, 'architectures') else 'unknown'}")
         
-        # Create LLaDA model with proper config handling
-        self.logger.info("Converting config to LlamaConfig...")
-        # Convert to LlamaConfig if it's not already
-        llama_config = LlamaConfig(
-            vocab_size=getattr(model_config, 'vocab_size', 32000),
-            hidden_size=getattr(model_config, 'hidden_size', 4096),
-            intermediate_size=getattr(model_config, 'intermediate_size', 11008),
-            num_hidden_layers=getattr(model_config, 'num_hidden_layers', 32),
-            num_attention_heads=getattr(model_config, 'num_attention_heads', 32),
-            num_key_value_heads=getattr(model_config, 'num_key_value_heads', 32),
-            max_position_embeddings=getattr(model_config, 'max_position_embeddings', 4096),
-            rms_norm_eps=getattr(model_config, 'rms_norm_eps', 1e-6),
-            rope_theta=getattr(model_config, 'rope_theta', 10000.0),
-            attention_bias=getattr(model_config, 'attention_bias', False),
-            tie_word_embeddings=getattr(model_config, 'tie_word_embeddings', False),
-        )
-        model_config = llama_config
-        
+        # Create the LLaDA model structure but then swap in the quantized base model
+        self.logger.info("Creating LLaDA model shell...")
         self.model = LLaDAForMaskedLM(model_config)
-        self.logger.info("Successfully created LLaDA model")
+        
+        self.logger.info("Swapping in base model...")
+        self.model.model = hf_model.model
+        
+        self.logger.info("Copying LM head...")
+        self.model.lm_head = hf_model.lm_head
 
-        # Copy weights from HuggingFace model more carefully
-        self.logger.info("Copying model weights...")
-        self.model.model.load_state_dict(hf_model.model.state_dict(), strict=False)
-        self.logger.info("Successfully copied base model weights")
-        
-        # Copy the language model head
-        self.model.lm_head.load_state_dict(hf_model.lm_head.state_dict(), strict=False)
-        self.logger.info("Successfully copied lm_head weights")
-        
         # Clean up HF model to save memory
-        del hf_model
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        # del hf_model
+        # torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
-        self.logger.info(f"Downloaded and converted model from {self.config.model_name_or_path}")
+        self.logger.info(f"Successfully adapted model to LLaDA structure.")
                 
         # Resize token embeddings for custom tokens
         original_vocab_size = self.model.config.vocab_size
@@ -182,16 +258,209 @@ class LLaDATTSTrainer:
             self.logger.info(f"Resizing embeddings from {original_vocab_size} to {new_vocab_size}")
             self.model.resize_token_embeddings(new_vocab_size)
         
-        # Move to device
-        # Enable gradient checkpointing for memory efficiency
-        self.model.gradient_checkpointing_enable()
-        self.logger.info("✅ Enabled gradient checkpointing")
-        
-        # Move to device with mixed precision
-        self.model = self.model.to(device=self.device, dtype=torch.bfloat16)
-        self.logger.info("✅ Using bfloat16 mixed precision")
-        self.logger.info(f"Model setup complete. Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        # Move model to device with appropriate precision
+        if bnb_config:
+            # Model is already on the correct device with quantization
+            self.logger.info(f"✅ Model with quantization on device {self.device}")
+        else:
+            # Determine the appropriate dtype
+            if getattr(self.config, 'fp16', True):
+                model_dtype = torch.float16
+                precision_info = "FP16"
+            else:
+                model_dtype = torch.float32
+                precision_info = "FP32"
+            
+            self.model = self.model.to(device=self.device, dtype=model_dtype)
+            self.logger.info(f"✅ Model moved to device {self.device} with {precision_info} precision")
+
+        # If not using FSDP but in a distributed environment, use DDP
+        if not self.config.fsdp and self.world_size > 1:
+            self.model = DDP(self.model, device_ids=[self.local_rank])
+            self.logger.info("🚀 Wrapped model with DistributedDataParallel (DDP)")
+
+        # Enable gradient checkpointing AFTER wrapping
+        if getattr(self.config, 'gradient_checkpointing', True):
+            # DDP requires accessing the original model via .module
+            model_to_checkpoint = self.model.module if isinstance(self.model, DDP) else self.model
+            model_to_checkpoint.gradient_checkpointing_enable()
+            self.logger.info("✅ Enabled gradient checkpointing")
+        else:
+            self.logger.info("⚠️ Gradient checkpointing disabled")
+
+        self.logger.info(f"Model setup complete. Parameters on rank {self.rank}: {sum(p.numel() for p in self.model.parameters()):,}")
     
+    def compute_position_aware_loss(self, logits: torch.Tensor, targets: torch.Tensor, 
+                                  masked_indices: torch.Tensor, input_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute position-aware loss that enforces SNAC hierarchical constraints (Vectorized)
+        
+        This function ensures that the model only predicts valid SNAC tokens for each 
+        position within the 7-token hierarchical frame structure.
+        
+        Args:
+            logits: Model output logits [batch_size, seq_len, vocab_size]
+            targets: Target token IDs [batch_size, seq_len]
+            masked_indices: Boolean mask indicating which positions to compute loss on
+            input_ids: Original input sequence for finding audio regions
+            
+        Returns:
+            dict: Loss statistics and debugging information
+        """
+        batch_size, seq_len, vocab_size = logits.shape
+        device = logits.device
+
+        # Constants for token detection
+        START_OF_SPEECH = 128257
+        END_OF_SPEECH = 128258
+
+        # Find start and end of speech for the whole batch
+        start_speech_indices = (input_ids == START_OF_SPEECH).nonzero(as_tuple=True)
+        end_speech_indices = (input_ids == END_OF_SPEECH).nonzero(as_tuple=True)
+
+        # Create a mask for valid audio regions to compute loss on
+        audio_region_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        
+        # This part still requires a loop, but it's over the batch size, not every token.
+        for batch_idx in range(batch_size):
+            # Find relevant start/end markers for this specific batch item
+            starts = start_speech_indices[1][start_speech_indices[0] == batch_idx]
+            ends = end_speech_indices[1][end_speech_indices[0] == batch_idx]
+            if len(starts) > 0 and len(ends) > 0:
+                # Use first start and end marker
+                audio_region_mask[batch_idx, starts[0] + 1:ends[0]] = True
+
+        # Combine with the original masked_indices
+        final_loss_mask = audio_region_mask & masked_indices
+        
+        # If no audio tokens are masked, return zero loss
+        if final_loss_mask.sum() == 0:
+            return {
+                "loss": torch.tensor(0.0, device=device, requires_grad=True),
+                "num_position_aware_tokens": 0,
+            }
+
+        # --- Vectorized Position Calculation ---
+        # Create a tensor representing the position of each token in the sequence
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Calculate the position within each 7-token frame
+        # We need to find the start of the audio segment for each batch item to do this accurately
+        # We assume the first START_OF_SPEECH token is the reference.
+        first_start_positions = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+        # Find the first occurrence of START_OF_SPEECH in each row using a vectorized approach
+        b_indices, s_indices = start_speech_indices
+        if b_indices.numel() > 0:
+           # Use scatter_reduce to find the minimum sequence index (first occurrence) for each batch index.
+           max_seq_len_val = seq_len + 1 
+           min_s_indices = torch.full((batch_size,), max_seq_len_val, dtype=torch.long, device=device)
+           min_s_indices.scatter_reduce_(0, b_indices, s_indices.long(), reduce="amin", include_self=False)
+           
+           # Update the positions where a start token was actually found
+           found_mask = min_s_indices != max_seq_len_val
+           first_start_positions[found_mask] = min_s_indices[found_mask]
+
+        # Calculate relative position from the start of speech token
+        relative_positions = positions - (first_start_positions[:, None] + 1)
+        position_in_frame = relative_positions % 7
+        
+        # Only consider positions within the valid audio regions
+        position_in_frame[~audio_region_mask] = -1 # Mark invalid positions
+
+        # --- Vectorized Logit Masking ---
+        # Create a mask for the entire vocabulary based on position
+        # Shape: [batch_size, seq_len, 7, vocab_size]
+        
+        # Create position-aware mask for the vocabulary
+        pos_in_frame_expanded = position_in_frame.unsqueeze(-1)
+        valid_codebook_indices = (pos_in_frame_expanded >= 0) * (pos_in_frame_expanded < 7)
+
+        # Create ranges for valid tokens for each position
+        base = SNAC_AUDIO_TOKEN_START
+        pos_indices = torch.arange(7, device=device)
+        start_tokens = base + pos_indices * SNAC_CODEBOOK_SIZE
+        end_tokens = start_tokens + SNAC_CODEBOOK_SIZE
+
+        # Get the valid ranges for each token in the input
+        # Shape: [batch_size, seq_len, 2]
+        valid_ranges = torch.stack([
+            torch.gather(start_tokens.unsqueeze(0).expand(batch_size, -1), 1, position_in_frame.clamp(0, 6)),
+            torch.gather(end_tokens.unsqueeze(0).expand(batch_size, -1), 1, position_in_frame.clamp(0, 6))
+        ], dim=-1)
+
+        # Create a full vocabulary mask
+        vocab_indices = torch.arange(vocab_size, device=device).view(1, 1, -1)
+        
+        # The mask is True where the token is *invalid*
+        logit_mask = ~((vocab_indices >= valid_ranges[..., 0:1]) & (vocab_indices < valid_ranges[..., 1:2]))
+        logit_mask[~final_loss_mask] = False # Don't mask logits that are not part of the loss
+
+        # Apply the mask to the logits
+        masked_logits = logits.masked_fill(logit_mask, float('-inf'))
+
+        # --- Loss Calculation ---
+        # Select only the logits and targets where we need to compute the loss
+        loss_logits = masked_logits[final_loss_mask]
+        loss_targets = targets[final_loss_mask]
+
+        if loss_logits.numel() == 0:
+            return {
+                "loss": torch.tensor(0.0, device=device, requires_grad=True),
+                "num_position_aware_tokens": 0,
+            }
+
+        loss = F.cross_entropy(loss_logits, loss_targets)
+
+        return {
+            "loss": loss,
+            "num_position_aware_tokens": loss_logits.size(0),
+        }
+
+    def _calculate_metrics(self, loss_outputs: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        """Calculates metrics in a no_grad context to avoid FSDP state errors."""
+        with torch.no_grad():
+            loss_type = loss_outputs.get("loss_type", "unknown")
+            loss = loss_outputs["loss"]
+            masked_indices = loss_outputs["masked_indices"]
+            input_ids = loss_outputs["input_ids"]
+            logits = loss_outputs["logits"]
+            
+            num_masked_tokens = masked_indices.sum()
+            if num_masked_tokens == 0:
+                return {
+                    "loss": loss.item(), "num_masked_tokens": 0, "perplexity": float('inf'), "loss_type": loss_type
+                }
+
+            perplexity = torch.exp(loss)
+            
+            metrics = {
+                "loss": loss.item(),
+                "num_masked_tokens": num_masked_tokens.item(),
+                "perplexity": perplexity.item(),
+                "loss_type": loss_type
+            }
+
+            # Add masking analysis and prediction sampling
+            from tts_forward_process import analyze_tts_masking
+            masking_analysis = analyze_tts_masking(input_ids, masked_indices=masked_indices)
+            metrics.update({
+                "audio_mask_percentage": masking_analysis["audio_mask_rate"],
+                "text_mask_percentage": masking_analysis["text_mask_rate"],
+                "correctly_targeted_masking": masking_analysis["correctly_targeted"]
+            })
+
+            masked_logits = logits[masked_indices]
+            masked_targets = input_ids[masked_indices]
+            masked_predictions = torch.argmax(masked_logits, dim=-1)
+            
+            sample_size = min(50, len(masked_targets))
+            metrics.update({
+                "sample_targets": masked_targets[:sample_size].cpu().tolist(),
+                "sample_predictions": masked_predictions[:sample_size].cpu().tolist(),
+            })
+
+            return metrics
+
     def setup_optimizer(self):
         """Setup optimizer and scheduler"""
         # AdamW optimizer
@@ -291,7 +560,7 @@ class LLaDATTSTrainer:
             sampler=sampler,
             collate_fn=lambda batch: tts_data_collator(batch, self.config.pad_token_id),
             drop_last=True,
-            num_workers=0,  # Set to 0 for FSDP compatibility
+            num_workers=self.config.num_workers,  # Set to 0 for FSDP compatibility
             pin_memory=True if torch.cuda.is_available() else False,
         )
     
@@ -344,8 +613,9 @@ class LLaDATTSTrainer:
         if masked_indices.sum() == 0:
             return {
                 "loss": torch.tensor(0.0, device=self.device, requires_grad=True),
-                "num_masked_tokens": torch.tensor(0),
-                "perplexity": torch.tensor(float('inf')),
+                "logits": logits,
+                "masked_indices": masked_indices,
+                "input_ids": input_ids,
                 "loss_type": "pretraining"
             }
         
@@ -354,24 +624,32 @@ class LLaDATTSTrainer:
         masked_targets = input_ids[masked_indices]
         masked_p_mask = p_mask[masked_indices]
         
-        # Compute cross-entropy loss
-        token_loss = F.cross_entropy(masked_logits, masked_targets, reduction='none')
-        
-        # Weight by inverse masking probability (optional)
-        if self.config.use_weighted_loss:
-            weighted_token_loss = token_loss / masked_p_mask
-            self.logger.debug(f"Using weighted loss (1/p_mask)")
+        # Choose loss computation method based on configuration
+        if getattr(self.config, 'use_position_aware_loss', False):
+            # Use position-aware loss for SNAC hierarchical constraints
+            position_loss_result = self.compute_position_aware_loss(logits, input_ids, masked_indices, input_ids)
+            loss = position_loss_result["loss"]
+            
+            self.logger.debug(f"Using position-aware loss with SNAC constraints")
         else:
-            weighted_token_loss = token_loss
-            self.logger.debug(f"Using unweighted loss")
-        
-        # Average loss
-        loss = weighted_token_loss.sum() / (input_ids.shape[0] * input_ids.shape[1])
+            # Standard cross-entropy loss
+            token_loss = F.cross_entropy(masked_logits, masked_targets, reduction='none')
+            
+            # Weight by inverse masking probability (optional)
+            if self.config.use_weighted_loss:
+                weighted_token_loss = token_loss / masked_p_mask
+                self.logger.debug(f"Using weighted loss (1/p_mask)")
+            else:
+                weighted_token_loss = token_loss
+                self.logger.debug(f"Using unweighted loss")
+            
+            # Average loss
+            loss = weighted_token_loss.sum() / (input_ids.shape[0] * input_ids.shape[1])
         
         # Compute metrics
         with torch.no_grad():
             num_masked_tokens = masked_indices.sum()
-            perplexity = torch.exp(token_loss.mean()) if len(token_loss) > 0 else torch.tensor(float('inf'))
+            perplexity = torch.exp(loss)
         
         # Collect additional debugging info
         debug_info = {}
@@ -425,10 +703,10 @@ class LLaDATTSTrainer:
 
         return {
             "loss": loss,
-            "num_masked_tokens": num_masked_tokens,
-            "perplexity": perplexity,
-            "loss_type": "pretraining",
-            **debug_info
+            "logits": logits,
+            "masked_indices": masked_indices,
+            "input_ids": input_ids,
+            "loss_type": "pretraining"
         }
     
     def _compute_sft_loss(self, input_ids: torch.Tensor, prompt_lengths: torch.Tensor, training_progress: float = None) -> Dict[str, torch.Tensor]:
@@ -484,8 +762,9 @@ class LLaDATTSTrainer:
         if masked_indices.sum() == 0:
             return {
                 "loss": torch.tensor(0.0, device=device, requires_grad=True),
-                "num_masked_tokens": torch.tensor(0),
-                "perplexity": torch.tensor(float('inf')),
+                "logits": logits,
+                "masked_indices": masked_indices,
+                "input_ids": input_ids,
                 "loss_type": "sft"
             }
         
@@ -495,25 +774,33 @@ class LLaDATTSTrainer:
         masked_p_mask = p_mask[masked_indices]
         masked_answer_lengths = answer_lengths[masked_indices]
         
-        # Compute cross-entropy loss
-        token_loss = F.cross_entropy(masked_logits, masked_targets, reduction='none')
-        
-        # Weight by inverse masking probability (optional)
-        if self.config.use_weighted_loss:
-            weighted_token_loss = token_loss / masked_p_mask
+        debug_info = {}
+        # Choose loss computation method based on configuration
+        if getattr(self.config, 'use_position_aware_loss', False):
+            # Use position-aware loss for SNAC hierarchical constraints
+            position_loss_result = self.compute_position_aware_loss(logits, input_ids, masked_indices, input_ids)
+            ce_loss = position_loss_result["loss"]
+            
+            self.logger.debug(f"Using position-aware SFT loss with SNAC constraints")
         else:
-            weighted_token_loss = token_loss
-        
-        # Normalize by answer length and batch size
-        ce_loss = torch.sum(weighted_token_loss / masked_answer_lengths) / batch_size
+            # Standard cross-entropy loss
+            token_loss = F.cross_entropy(masked_logits, masked_targets, reduction='none')
+            
+            # Weight by inverse masking probability (optional)
+            if self.config.use_weighted_loss:
+                weighted_token_loss = token_loss / masked_p_mask
+            else:
+                weighted_token_loss = token_loss
+            
+            # Normalize by answer length and batch size
+            ce_loss = torch.sum(weighted_token_loss / masked_answer_lengths) / batch_size
         
         # Compute metrics
         with torch.no_grad():
             num_masked_tokens = masked_indices.sum()
-            perplexity = torch.exp(token_loss.mean()) if len(token_loss) > 0 else torch.tensor(float('inf'))
+            perplexity = torch.exp(ce_loss)
         
         # Add TTS masking analysis and prediction sampling for SFT too
-        debug_info = {}
         if num_masked_tokens > 0:
             masking_analysis = analyze_tts_masking(input_ids, masked_indices=masked_indices)
             debug_info.update({
@@ -559,10 +846,10 @@ class LLaDATTSTrainer:
         
         return {
             "loss": ce_loss,
-            "num_masked_tokens": num_masked_tokens,
-            "perplexity": perplexity,
-            "loss_type": "sft",
-            **debug_info
+            "logits": logits,
+            "masked_indices": masked_indices,
+            "input_ids": input_ids,
+            "loss_type": "sft"
         }
     
     def update_momentum_and_lr(self, global_step: int, total_steps: int):
@@ -605,8 +892,8 @@ class LLaDATTSTrainer:
         self._last_training_progress = training_progress
         
         # Compute loss with training progress for linear masking schedule
-        loss_dict = self.compute_loss(batch, training_progress)
-        loss = loss_dict["loss"]
+        loss_outputs = self.compute_loss(batch, training_progress)
+        loss = loss_outputs["loss"]
         
         # Backward pass
         if self.config.gradient_accumulation_steps > 1:
@@ -614,8 +901,8 @@ class LLaDATTSTrainer:
         
         loss.backward()
         
-        # Convert to float for logging
-        metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
+        # Calculate metrics for logging
+        metrics = self._calculate_metrics(loss_outputs)
         
         return metrics
     
@@ -659,12 +946,18 @@ class LLaDATTSTrainer:
                 debug_metrics = {}
                 for key in ["target_text_tokens", "target_custom_tokens", "pred_text_tokens", "pred_custom_tokens",
                            "text_token_ratio", "custom_token_ratio", "audio_mask_percentage", "text_mask_percentage", 
-                           "correctly_targeted_masking"]:
+                           "correctly_targeted_masking", "position_aware_tokens", "valid_target_ratio", "avg_position_accuracy"]:
                     if key in metrics:
                         debug_metrics[f"debug_{key}"] = metrics[key]
                 wandb_metrics.update(debug_metrics)
+                
+                # Add position-specific metrics if available
+                if "position_stats" in metrics:
+                    for pos, stats in metrics["position_stats"].items():
+                        wandb_metrics[f"position_{pos}_accuracy"] = stats["accuracy"]
+                        wandb_metrics[f"position_{pos}_loss"] = stats["avg_loss"]
             
-            if self.config.wandb_project:
+            if self.use_wandb:
                 wandb.log(wandb_metrics, step=global_step)
             
             # Enhanced console logging with token analysis
@@ -695,6 +988,12 @@ class LLaDATTSTrainer:
                     console_msg += f", audio_masked={metrics['audio_mask_percentage']:.1f}%"
                 if "correctly_targeted_masking" in metrics:
                     console_msg += f", correct_masking={'✅' if metrics['correctly_targeted_masking'] else '❌'}"
+                
+                # Add position-aware metrics
+                if "avg_position_accuracy" in metrics:
+                    console_msg += f", pos_acc={metrics['avg_position_accuracy']:.3f}"
+                if "valid_target_ratio" in metrics:
+                    console_msg += f", valid_targets={metrics['valid_target_ratio']:.3f}"
             
             self.logger.info(console_msg)
             
@@ -722,7 +1021,7 @@ class LLaDATTSTrainer:
                         if key in metrics:
                             wandb_metrics[f"debug_{key}"] = metrics[key]
                 
-                if self.config.wandb_project:
+                if self.use_wandb:
                     wandb.log(wandb_metrics, step=global_step)
                 
                 console_msg = (
@@ -752,7 +1051,7 @@ class LLaDATTSTrainer:
                     "global_step": global_step,
                     "learning_rate": self.scheduler.get_last_lr()[0] if hasattr(self.scheduler, 'get_last_lr') else self.config.learning_rate
                 }
-                if self.config.wandb_project:
+                if self.use_wandb:
                     wandb.log(wandb_metrics, step=global_step)
                 
                 self.logger.info(
@@ -763,7 +1062,7 @@ class LLaDATTSTrainer:
     
     def _log_prediction_analysis(self, metrics: Dict[str, Any], global_step: int):
         """Log detailed prediction vs ground truth analysis to WandB"""
-        if not self.config.wandb_project:
+        if not self.use_wandb:
             return
             
         try:
@@ -909,53 +1208,75 @@ class LLaDATTSTrainer:
         except Exception as e:
             self.logger.warning(f"Failed to save predictions to file: {e}")
     
-    def save_model(self, output_dir: str, step: int, epoch: int = None):
+    def save_checkpoint(self, output_dir: str, is_interrupt: bool = False):
         """Save model checkpoint"""
         if not self.is_main_process():
             return
-        
+
         os.makedirs(output_dir, exist_ok=True)
         
+        # Determine the model to save from (DDP wraps the original model in a .module attribute)
+        model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
+
         if isinstance(self.model, FSDP):
-            # FSDP model saving
             save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, save_policy):
                 cpu_state_dict = self.model.state_dict()
-            
-            # Save model state
             torch.save(cpu_state_dict, os.path.join(output_dir, "pytorch_model.bin"))
         else:
-            # Regular model saving
-            torch.save(self.model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
-        
-        # Save tokenizer
+            torch.save(model_to_save.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+
         self.tokenizer.save_pretrained(output_dir)
-        
-        # Save config
+
         with open(os.path.join(output_dir, "config.json"), "w") as f:
             json.dump(self.config.__dict__, f, indent=2)
-        
-        # Save training state
+
         training_state = {
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
-            "step": step,
-            "epoch": epoch,
+            "step": self.global_step,
+            "epoch": self.start_epoch,
             "text_step": self.text_step,
             "audio_step": self.audio_step
         }
         torch.save(training_state, os.path.join(output_dir, "training_state.bin"))
         
-        self.logger.info(f"Model saved to {output_dir}")
-    
+        if is_interrupt:
+            self.logger.info(f"Interruption checkpoint saved to {output_dir}")
+        else:
+            self.logger.info(f"Model saved to {output_dir}")
+
+    def load_checkpoint(self, checkpoint_dir: str):
+        """Load model checkpoint"""
+        if not os.path.exists(checkpoint_dir):
+            self.logger.warning(f"Checkpoint directory not found: {checkpoint_dir}")
+            return
+            
+        model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
+
+        model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
+        if os.path.exists(model_path):
+            model_to_load.load_state_dict(torch.load(model_path, map_location=self.device))
+            self.logger.info(f"Loaded model state from {model_path}")
+
+        training_state_path = os.path.join(checkpoint_dir, "training_state.bin")
+        if os.path.exists(training_state_path):
+            training_state = torch.load(training_state_path, map_location=self.device)
+            self.optimizer.load_state_dict(training_state["optimizer"])
+            self.scheduler.load_state_dict(training_state["scheduler"])
+            self.global_step = training_state.get("step", 0)
+            self.start_epoch = training_state.get("epoch", 0)
+            self.text_step = training_state.get("text_step", 0)
+            self.audio_step = training_state.get("audio_step", 0)
+            self.logger.info(f"Loaded training state from {training_state_path}. Resuming from step {self.global_step} at epoch {self.start_epoch}")
+
     def train(self):
         """Main training loop using epochs"""
         self.logger.info(f"Starting TTS training with {len(self.combined_dataset)} examples for {self.config.epochs} epochs")
         self.logger.info(f"🎯 Training mode: {self.config.training_mode.upper()}")
         
-        global_step = 0
-        # Calculate total training steps for optimization schedules
         total_steps = self.steps_per_epoch * self.config.epochs
+        steps_per_save = int(self.config.save_epochs * self.steps_per_epoch) if self.config.save_epochs > 0 else 0
         
         # Log enabled optimization strategies
         optimizations = []
@@ -971,7 +1292,7 @@ class LLaDATTSTrainer:
             self.logger.info(opt)
         
         # Training loop by epochs
-        for epoch in range(self.config.epochs):
+        for epoch in range(self.start_epoch, self.config.epochs):
             self.logger.info(f"Starting epoch {epoch + 1}/{self.config.epochs}")
             
             # Set epoch for distributed sampler
@@ -992,24 +1313,30 @@ class LLaDATTSTrainer:
             # Training loop for this epoch
             for step, batch in enumerate(progress_bar):
                 # Training step with linear masking schedule
-                metrics = self.train_step(batch, global_step, total_steps)
+                metrics = self.train_step(batch, self.global_step, total_steps)
                 
                 # Gradient accumulation
                 if (step + 1) % self.config.gradient_accumulation_steps == 0:
                     # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                    if self.config.max_grad_norm and self.config.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                     
                     # Optimizer step
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
                     
-                    global_step += 1
+                    self.global_step += 1
                     epoch_loss += metrics['loss']
                     num_batches += 1
                     
+                    if self.global_step > 0 and steps_per_save > 0 and self.global_step % steps_per_save == 0:
+                        checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-step-{self.global_step}")
+                        self.logger.info(f"Saving checkpoint at step {self.global_step} to {checkpoint_dir}")
+                        self.save_checkpoint(checkpoint_dir)
+
                     # Log metrics periodically
-                    if global_step % 10 == 0:
+                    if self.global_step % 10 == 0:
                         if self.is_main_process():
                             # Print loss immediately
                             loss_type = "audio" if self.config.ratio == 0.0 else metrics.get('loss_type', 'unknown')
@@ -1017,7 +1344,7 @@ class LLaDATTSTrainer:
                             ppl = torch.exp(torch.tensor(metrics['loss'])).item()
                             self.logger.info(f"Epoch {epoch + 1}, Step {current_step}: loss={metrics['loss']:.4f}, ppl={ppl:.2f}, masked_tokens={metrics.get('num_masked_tokens', 'N/A')}")
                             
-                            self.log_metrics(metrics, global_step, epoch)
+                            self.log_metrics(metrics, self.global_step, epoch)
                 
                 # Update progress bar
                 progress_bar.set_postfix({
@@ -1025,26 +1352,16 @@ class LLaDATTSTrainer:
                     "type": metrics.get('loss_type', 'unknown'),
                     "epoch_avg": f"{epoch_loss / max(num_batches, 1):.4f}"
                 })
-            
+
             # Calculate epoch average loss
             avg_epoch_loss = epoch_loss / max(num_batches, 1)
             self.logger.info(f"Epoch {epoch + 1} completed! Average loss: {avg_epoch_loss:.4f}")
-            
-            # Save checkpoint after each epoch (or based on save_epochs)
-            if (epoch + 1) % self.config.save_epochs == 0:
-                checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-epoch-{epoch + 1}")
-                self.logger.info(f"Saving checkpoint after epoch {epoch + 1} to {checkpoint_dir}")
-                try:
-                    self.save_model(checkpoint_dir, global_step, epoch + 1)
-                    self.logger.info(f"Successfully saved checkpoint for epoch {epoch + 1}")
-                except Exception as e:
-                    self.logger.error(f"Failed to save checkpoint after epoch {epoch + 1}: {e}")
             
             progress_bar.close()
         
         # Save final checkpoint
         if self.is_main_process():
             final_checkpoint_dir = os.path.join(self.config.output_dir, "final_checkpoint")
-            self.save_model(final_checkpoint_dir, global_step, self.config.epochs)
+            self.save_checkpoint(final_checkpoint_dir)
             self.logger.info(f"Training completed! Final model saved to {final_checkpoint_dir}")
-            self.logger.info(f"Total training steps: {global_step}")
+            self.logger.info(f"Total training steps: {self.global_step}")

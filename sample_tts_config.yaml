@@ -1,5 +1,5 @@
 # Dataset configuration
-TTS_dataset: "/workspace/combined_tts_dataset_pretrain"
+TTS_dataset: "/mnt/disk3/Orpheus-TTS/combined_tts_dataset_pretrain_v2"
 # text_QA_dataset: "/path/to/your/text/dataset"  # Comment out for TTS-only training
 
 voice_type: "all"
@@ -11,26 +11,34 @@ tokenizer_name: "meta-llama/Llama-3.2-1B-Instruct"
 # tokenizer_name: "canopylabs/3b-hi-pretrain-research_release"
 
 # Training arguments - Memory optimized for H100 80GB
-epochs: 10
-batch_size: 8
-gradient_accumulation_steps: 1
-number_processes: 4
+epochs: 1
+batch_size: 1  # Conservative: Start with bs=4, increase gradually based on available memory
+gradient_accumulation_steps: 32  # Use some accumulation to maintain effective batch size of 8
+number_processes: 1
 pad_token: 128263
-save_epochs: 1  # Save checkpoint every N epochs
+save_epochs: 0.1  # Save checkpoint every N epochs
 learning_rate: 5.0e-5
-lr_scheduler_type: "linear"
-max_grad_norm: 1.0
-max_length: 2048
+lr_scheduler_type: "constant"
+max_grad_norm: -1  # Max gradient norm for clipping. Set to 0 or a negative value to disable.
+max_length: 2560
+num_workers: 8
+use_position_aware_loss: true
 
-# Performance optimizations (essential for H100 + FlashAttention)
-bf16: true  # Required for FlashAttention acceleration on H100
+# Performance optimizations (essential for H100 + FlashAttention + Liger)
+fsdp: false
+bf16: false  # Required for FlashAttention acceleration on H100
 gradient_checkpointing: true  # Memory optimization
 compile_model: false  # Can enable for PyTorch 2.0+ if desired
+use_liger_kernel: false  # Liger Kernel: 20% speedup + 60% memory reduction
+use_bnb_quantization: false  # Use BitsAndBytes for memory savings
+bnb_4bit: false  # Use 4-bit quantization
+fp16: false  # Use FP16 mixed precision training
 
 # Naming and paths
-save_folder: "checkpoints_llada_tts"
+save_folder: "checkpoints_llada_tts_1b"
 project_name: "llada-tts-experiment"
-run_name: "llada-tts-run-1"
+run_name: "llada-tts-run-1b"
+use_wandb: true
 
 # TTS-specific settings (optional, will use defaults)
 # num_audio_tokens: 28672  # 7 * 4096
